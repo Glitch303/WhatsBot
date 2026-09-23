@@ -15,9 +15,9 @@ AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME")
 AZURE_SUBSCRIPTION_KEY = os.getenv("AZURE_SUBSCRIPTION_KEY")
 AZURE_API_VERSION = os.getenv("AZURE_API_VERSION")
 
-# llama.cpp configuration (local server via llama-server)
-LLAMACPP_BASE_URL = os.getenv("LLAMACPP_BASE_URL", "http://localhost:8080/v1")
-LLAMACPP_MODEL = os.getenv("LLAMACPP_MODEL", "model")
+# llama.cpp / llama-swap configuration (local OpenAI-compatible server)
+LLAMACPP_BASE_URL = os.getenv("LLAMACPP_BASE_URL", "http://localhost:27906/v1")
+LLAMACPP_MODEL = os.getenv("LLAMACPP_MODEL", "Qwen3.8-Orca-27B-Instruct")
 
 # Prompt Configuration
 MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", "5"))
