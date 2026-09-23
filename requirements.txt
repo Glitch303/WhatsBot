@@ -1,0 +1,8 @@
+neonize
+python-dotenv
+openai
+requests
+pdfplumber
+python-docx
+segno
+protobuf
