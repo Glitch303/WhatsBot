@@ -18,10 +18,20 @@ def configure_logging():
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    # Create and configure a console handler (logs only INFO and above)
+    # Console handler: keep the console clean for the interactive terminal prompt.
+    # Only WARNING+ shows here (the noisy filter below silences neonize/whatsmeow chatter).
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)  # Only log INFO and above to the console
+    console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
+
+    class NoisyFilter(logging.Filter):
+        """Only let neonize/whatsmeow logs through if they are ERROR or higher."""
+        NOISY = ("neonize", "whatsmeow")
+        def filter(self, record):
+            if any(record.name.startswith(p) for p in self.NOISY):
+                return record.levelno >= logging.ERROR
+            return True
+    console_handler.addFilter(NoisyFilter())
     logger.addHandler(console_handler)
 
 def main():
@@ -62,12 +72,81 @@ def main():
     # Initialize DB
     init_db()
 
+    # Terminal control commands (run in a background thread so the event loop keeps running)
+    import threading
+    from bot_settings import get_settings, toggle as toggle_setting, status_text
+
+    def tprint(msg, level="info"):
+        """Print to the terminal (clean) AND log to app.log."""
+        prefix = {"info": "•", "ok": "✓", "err": "✗"}.get(level, "•")
+        print(f"{prefix} {msg}")
+        log_fn = {"info": logging.info, "ok": logging.info, "err": logging.error}[level]
+        log_fn(f"Terminal: {msg}")
+
+    def print_settings():
+        print()
+        for line in status_text().splitlines():
+            print(line)
+        print()
+
+    def terminal_loop():
+        tprint("Commands: status | replies <group_mention|dm|self_chat> <on|off> | pause | resume | quit")
+        while True:
+            try:
+                line = input("bot> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not line:
+                continue
+            parts = line.split()
+            cmd = parts[0].lower()
+            if cmd in ("quit", "exit", "q"):
+                tprint("Exiting.", "info")
+                os._exit(0)
+            elif cmd == "status":
+                print_settings()
+            elif cmd == "replies":
+                # replies <group_mention|dm|self_chat> <on|off>
+                if len(parts) < 3:
+                    tprint("Usage: replies <group_mention|dm|self_chat> <on|off>", "err")
+                    continue
+                key = parts[1].lower().replace("-", "_").replace(" ", "_")
+                if key == "selfchat":
+                    key = "self_chat"
+                val = parts[2].lower()
+                if val not in ("on", "off", "true", "false"):
+                    tprint(f"Invalid value: {val}. Use 'on' or 'off'.", "err")
+                    continue
+                ok, msg = toggle_setting(key, val in ("on", "true"))
+                if ok:
+                    tprint(msg, "ok")
+                    print_settings()
+                else:
+                    tprint(msg, "err")
+            elif cmd == "pause":
+                from whatsapp import set_bot_running
+                set_bot_running(False)
+                tprint("Bot paused.", "ok")
+            elif cmd == "resume":
+                from whatsapp import set_bot_running
+                set_bot_running(True)
+                tprint("Bot resumed.", "ok")
+            else:
+                tprint(f"Unknown command: {cmd}. Try: status, replies, pause, resume, quit", "err")
+
+    threading.Thread(target=terminal_loop, daemon=True).start()
+
     # Create the client
     client = NewClient(NEO_DB_PATH)
 
     @client.event(ConnectedEv)
     def on_connected(client: NewClient, connected: ConnectedEv):
-        client.send_presence(presence=Presence.AVAILABLE)
+        try:
+            client.send_presence(presence=Presence.AVAILABLE)
+        except Exception as e:
+            # whatsmeow can reject presence right after auth if PushName isn't
+            # synced yet. Non-fatal — the bot still works.
+            logging.warning(f"Could not send presence yet (non-fatal): {e}")
         logging.info("✓ Connected")
 
     @client.event(HistorySyncEv)

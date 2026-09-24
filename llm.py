@@ -12,11 +12,21 @@ from config import (
     AZURE_DEPLOYMENT_NAME,
     AZURE_ENDPOINT,
     AZURE_SUBSCRIPTION_KEY,
+    CONTEXT_CHAR_BUDGET,
     LLM_PROVIDER,
     LLAMACPP_BASE_URL,
     LLAMACPP_MODEL,
+    MAX_REPLY_TOKENS,
+    MAX_REPLY_WORDS,
+    SESSION_GAP_SECONDS,
+    VERBATIM_TURNS,
 )
-from database import get_recent_messages_formatted
+from database import (
+    get_recent_messages_formatted,
+    get_verbatim_tail,
+    is_new_session,
+    get_session_stats,
+)
 
 
 def get_client_and_model():
@@ -64,7 +74,7 @@ def call_llm_api(system_prompt: str, user_prompt: str) -> str:
         response = client.chat.completions.create(
             model=model,
             messages=messages,
-            max_tokens=500,
+            max_tokens=MAX_REPLY_TOKENS,
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -126,7 +136,7 @@ def call_watchdog_llm(user_message: str, watchdog_prompt: str) -> Tuple[bool, Op
 
     system_prompt = watchdog_prompt.format(
         user_message=user_message,
-        additional_content=additional_content or "Ei lisätietoa tiedostoista.",
+        additional_content=additional_content or "No additional info from files.",
     )
 
     result = _call_llm_structured(system_prompt, user_message)
@@ -170,17 +180,70 @@ def generate_first_time_greeting(user_name: str, user_message: str, public_promp
     return final_response
 
 
-def generate_final_response(user_id: str, user_text: str, public_prompt: str, private_prompt: str) -> str:
+def build_context(user_id: str, current_message: str, char_budget: int = None) -> str:
+    """
+    Build a budget-aware context string from the user's verbatim message tail.
+    Returns a formatted conversation block that fits within char_budget.
+    If the tail is empty (first message), returns "".
+    """
+    if char_budget is None:
+        char_budget = CONTEXT_CHAR_BUDGET
+
+    tail = get_verbatim_tail(user_id, VERBATIM_TURNS)
+    if not tail:
+        return ""
+
+    # Format tail as conversation lines (newest last)
+    lines = []
+    for content, ts, from_me in tail:
+        speaker = "ASSISTANT" if from_me else "USER"
+        lines.append(f"{speaker}: {content}")
+
+    # Trim from the oldest end if over budget.
+    # Reserve space for the current message + separators.
+    reserved = len(current_message) + 60  # separators, labels
+    available = char_budget - reserved
+
+    # Walk from newest to oldest, accumulating until we hit the budget
+    kept = []
+    used = 0
+    for line in reversed(lines):
+        line_cost = len(line) + 2  # + newline
+        if used + line_cost > available and kept:
+            break
+        kept.insert(0, line)
+        used += line_cost
+
+    return "\n".join(kept)
+
+
+def generate_final_response(user_id: str, user_text: str, public_prompt: str, private_prompt: str, user_name: str = "User") -> str:
     """
     Generates the final response combining public and private prompts,
-    conversation history, and converted file content.
+    session context, and converted file content.
     """
-    conversation_history = get_recent_messages_formatted(user_id)
+    # Session detection
+    is_new, is_first = is_new_session(user_id)
+    stats = get_session_stats(user_id)
+
+    # Build budget-aware context
+    context = build_context(user_id, user_text)
     additional_content = _read_converted_files()
+
+    # Session metadata for the prompt
+    if is_first:
+        session_info = "This is the user's first message ever."
+    elif is_new:
+        gap_hours = stats["session_gap_seconds"] / 3600 if stats["session_gap_seconds"] else 0
+        session_info = f"New session. Last conversation ended {gap_hours:.1f} hours ago."
+    else:
+        session_info = f"Ongoing session ({stats['session_age_seconds'] // 60} min active, {stats['message_count']} total messages)."
 
     system_prompt = (public_prompt + "\n" + private_prompt).format(
         ai_assistant_name=AI_ASSISTANT_NAME,
-        previous_messages=conversation_history,
-        additional_content=additional_content or "Ei lisätietoa tiedostoista.",
-    )
+        previous_messages=context or "(no previous messages)",
+        additional_content=additional_content or "No additional info from files.",
+        max_reply_words=MAX_REPLY_WORDS,
+        session_info=session_info,
+    ).replace("USER_NAME_HERE", user_name)
     return call_llm_api(system_prompt, user_text)
