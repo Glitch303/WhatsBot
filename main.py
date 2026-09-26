@@ -1,183 +1,156 @@
 import logging
 import os
-import segno
+import threading
 
 def configure_logging():
-    # Create a logger
     logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)  # Set the overall logging level to DEBUG
-
-    # Define a common log format
+    logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-
-    # Create and configure a file handler (logs everything)
     file_handler = logging.FileHandler("app.log", encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)  # Log all messages (DEBUG and above)
+    file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-
-    # Console handler: keep the console clean for the interactive terminal prompt.
-    # Only WARNING+ shows here (the noisy filter below silences neonize/whatsmeow chatter).
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-
-    class NoisyFilter(logging.Filter):
-        """Only let neonize/whatsmeow logs through if they are ERROR or higher."""
-        NOISY = ("neonize", "whatsmeow")
-        def filter(self, record):
-            if any(record.name.startswith(p) for p in self.NOISY):
-                return record.levelno >= logging.ERROR
-            return True
-    console_handler.addFilter(NoisyFilter())
-    logger.addHandler(console_handler)
 
 def main():
     configure_logging()
 
     from neonize.utils import log
     log.setLevel(logging.DEBUG)
-    import signal
     from neonize.client import NewClient
-    from neonize.events import (
-        MessageEv,
-        ConnectedEv,
-        HistorySyncEv,
-        QREv,
-        event
-    )
+    from neonize.events import MessageEv, ConnectedEv, HistorySyncEv, QREv
     from neonize.utils.enum import Presence
+    import segno
+
     from database import init_db
     from config import CONV_DB_PATH, NEO_DB_PATH
-    from whatsapp import on_history_sync, on_message
+    from whatsapp import on_history_sync, on_message, start_cleanup_thread, set_bot_running
+    from menu import run_menu
 
-    # A global event to handle interrupts
-    stop_event = event
-
-    def interrupted(*_):
-        """Signal handler for Ctrl+C."""
-        logging.info("Received interrupt, terminating.")
-        os._exit(0)  # Forceful, immediate termination
-
-    signal.signal(signal.SIGINT, interrupted)
-
-    # Create the DB directory if it doesn't exist
+    # --- Setup ---
     os.makedirs(os.path.dirname(CONV_DB_PATH), exist_ok=True)
     os.makedirs("messages", exist_ok=True)
     os.makedirs("downloads", exist_ok=True)
     os.makedirs("converted", exist_ok=True)
-
-    # Initialize DB
     init_db()
+    start_cleanup_thread()
 
-    # Terminal control commands (run in a background thread so the event loop keeps running)
-    import threading
-    from bot_settings import get_settings, toggle as toggle_setting, status_text
+    # --- Shared state ---
+    state = {"client": None, "connected": False}
+    connect_event = threading.Event()  # set when ConnectedEv fires
+    pause_flag = [False]  # used by live view for pause/resume
 
-    def tprint(msg, level="info"):
-        """Print to the terminal (clean) AND log to app.log."""
-        prefix = {"info": "•", "ok": "✓", "err": "✗"}.get(level, "•")
-        print(f"{prefix} {msg}")
-        log_fn = {"info": logging.info, "ok": logging.info, "err": logging.error}[level]
-        log_fn(f"Terminal: {msg}")
+    # --- Connect: establish WhatsApp session (login only) ---
+    # Connect does NOT start the bot or enter the live view -- those are
+    # separate menu steps. It only logs the bot in so the session shows as
+    # "CONNECTED" and self-chat works while the bot is in standby.
+    def connect_fn():
+        connect_event.clear()
+        client = NewClient(NEO_DB_PATH)
+        state["client"] = client
 
-    def print_settings():
-        print()
-        for line in status_text().splitlines():
-            print(line)
-        print()
-
-    def terminal_loop():
-        tprint("Commands: status | replies <group_mention|dm|self_chat> <on|off> | pause | resume | quit")
-        while True:
+        @client.event(ConnectedEv)
+        def on_connected(c, ev):
             try:
-                line = input("bot> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                break
-            if not line:
-                continue
-            parts = line.split()
-            cmd = parts[0].lower()
-            if cmd in ("quit", "exit", "q"):
-                tprint("Exiting.", "info")
-                os._exit(0)
-            elif cmd == "status":
-                print_settings()
-            elif cmd == "replies":
-                # replies <group_mention|dm|self_chat> <on|off>
-                if len(parts) < 3:
-                    tprint("Usage: replies <group_mention|dm|self_chat> <on|off>", "err")
-                    continue
-                key = parts[1].lower().replace("-", "_").replace(" ", "_")
-                if key == "selfchat":
-                    key = "self_chat"
-                val = parts[2].lower()
-                if val not in ("on", "off", "true", "false"):
-                    tprint(f"Invalid value: {val}. Use 'on' or 'off'.", "err")
-                    continue
-                ok, msg = toggle_setting(key, val in ("on", "true"))
-                if ok:
-                    tprint(msg, "ok")
-                    print_settings()
-                else:
-                    tprint(msg, "err")
-            elif cmd == "pause":
-                from whatsapp import set_bot_running
-                set_bot_running(False)
-                tprint("Bot paused.", "ok")
-            elif cmd == "resume":
-                from whatsapp import set_bot_running
-                set_bot_running(True)
-                tprint("Bot resumed.", "ok")
-            else:
-                tprint(f"Unknown command: {cmd}. Try: status, replies, pause, resume, quit", "err")
-
-    threading.Thread(target=terminal_loop, daemon=True).start()
-
-    # Create the client
-    client = NewClient(NEO_DB_PATH)
-
-    @client.event(ConnectedEv)
-    def on_connected(client: NewClient, connected: ConnectedEv):
-        try:
-            client.send_presence(presence=Presence.AVAILABLE)
-        except Exception as e:
-            # whatsmeow can reject presence right after auth if PushName isn't
-            # synced yet. Non-fatal — the bot still works.
-            logging.warning(f"Could not send presence yet (non-fatal): {e}")
-        logging.info("✓ Connected")
-
-    @client.event(HistorySyncEv)
-    def handle_history_sync(client: NewClient, history: HistorySyncEv):
-        on_history_sync(client, history)
-
-    @client.event(MessageEv)
-    def handle_message(client: NewClient, message: MessageEv):
-        on_message(client, message)
-
-    @client.event(QREv)
-    def handle_qr(client: NewClient, qr: QREv):
-        """Handle QR code event."""
-        logging.info("QR Code received.")
-        if qr.Codes:
-            qr_data_string = qr.Codes[0]
-            try:
-                qr_code = segno.make(qr_data_string)
-                qr_code.terminal(compact=True)
+                c.send_presence(presence=Presence.AVAILABLE)
             except Exception as e:
-                logging.error(f"Failed to generate or print QR code: {e}")
-                logging.error(f"QR Codes data received: {qr.Codes}")
-        else:
-            logging.warning("Received QREv with no QR codes data.")
+                logging.warning(f"Could not send presence yet (non-fatal): {e}")
+            logging.info("Connected to WhatsApp")
+            # NOTE: the bot is left in standby (is_bot_running=False) so that
+            # self-chat works while connected. Starting the bot is [4] Start.
+            set_bot_running(False)
+            state["connected"] = True
+            connect_event.set()
 
-    # Connect the client
-    client.connect()
+        @client.event(HistorySyncEv)
+        def handle_history_sync(c, ev):
+            on_history_sync(c, ev)
 
-    # Keep the program running until a signal is received
-    stop_event.wait()
-    logging.info("Exiting...")
+        @client.event(MessageEv)
+        def handle_message(c, ev):
+            on_message(c, ev)
+
+        @client.event(QREv)
+        def handle_qr(c, ev):
+            logging.info("QR Code received. Scan with WhatsApp (Linked Devices).")
+            if ev.Codes:
+                try:
+                    segno.make(ev.Codes[0]).terminal(compact=True)
+                except Exception as e:
+                    logging.error(f"Failed to display QR: {e}")
+
+        # Run connect() in a daemon thread -- it blocks in the event loop
+        def _run_connect():
+            try:
+                client.connect()
+            except Exception as e:
+                logging.error(f"Connection error: {e}")
+                state["client"] = None
+                connect_event.set()  # unblock the menu
+
+        t = threading.Thread(target=_run_connect, daemon=True)
+        t.start()
+
+        # Wait for the ConnectedEv callback (up to 120s for QR scan)
+        for _ in range(120):
+            if connect_event.is_set():
+                if not state["connected"]:
+                    return False
+                # Session connected -- do NOT start the bot or enter live view
+                # (those are the separate [4] Start step). Keep session alive.
+                return True
+            from menu import check_and_reset_ctrl_c
+            if check_and_reset_ctrl_c():
+                logging.info("Connection aborted (Ctrl+C)")
+                # Use the shared disconnect_fn to reset state consistently
+                disconnect_fn()
+                return False
+            connect_event.wait(timeout=1)
+        logging.warning("Connection timed out (120s)")
+        return False
+
+    # --- Disconnect: stop bot + session disconnect ---
+    def disconnect_fn():
+        set_bot_running(False)
+        logging.info("Bot stopped (standby)")
+        if state["client"]:
+            def _do_disconnect():
+                try:
+                    state["client"].disconnect()
+                except Exception as e:
+                    logging.warning(f"Disconnect error: {e}")
+            t = threading.Thread(target=_do_disconnect, daemon=True)
+            t.start()
+        state["client"] = None
+        state["connected"] = False
+        logging.info("Disconnected from WhatsApp")
+
+    # --- Start the bot only: keep the session connected.
+    # This is [4] Start, so the activates processing while the session stays live
+    # (self-chat keeps working; other messages are processed too).
+    def start_bot_fn():
+        set_bot_running(True)
+        state["connected"] = True  # session remains connected
+
+    # --- Stop the bot only: leave the session connected.
+    # This is [4] Start -> Stop, so the bot returns to standby without dropping
+    # the session (self-chat keeps working).
+    def stop_bot_fn():
+        set_bot_running(False)
+        logging.info("Bot stopped (session stays connected)")
+        state["connected"] = True  # session remains connected
+
+    # --- Run the menu loop ---
+    try:
+        run_menu(connect_fn, start_bot_fn, disconnect_fn, stop_bot_fn)
+    except KeyboardInterrupt:
+        logging.info("Interrupted.")
+    finally:
+        disconnect_fn()
+        logging.info("Exited.")
+    # Hard exit -- the neonize event loop thread may not fully stop
+    os._exit(0)
 
 if __name__ == "__main__":
     main()

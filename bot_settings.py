@@ -10,10 +10,10 @@ import threading
 
 _lock = threading.Lock()
 
-# Defaults: group mention OFF, DM OFF, self-chat ON
+# Defaults: group mention OFF, DM ON, self-chat ON
 _bot_settings = {
     "group_mention": False,  # reply to @mentions in groups
-    "dm": False,             # reply to direct messages
+    "dm": True,             # reply to direct messages
     "self_chat": True,       # reply in the bot's own self-chat
 }
 

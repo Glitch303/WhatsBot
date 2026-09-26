@@ -1,6 +1,7 @@
 import os
 import random
 import re
+import threading
 import time
 from collections import defaultdict, deque
 
@@ -12,7 +13,7 @@ from neonize.utils import log
 from neonize.utils.enum import ChatPresence, ChatPresenceMedia, ReceiptType
 from neonize.utils.jid import Jid2String
 
-from config import ADMIN_NUMBERS, REPLY_WHITELIST, SESSION_GAP_SECONDS
+from config import ADMIN_NUMBERS, REPLY_WHITELIST, SESSION_GAP_SECONDS, VERBATIM_TURNS
 from bot_settings import get_settings, toggle as toggle_setting, status_text
 from database import (
     delete_messages,
@@ -20,9 +21,14 @@ from database import (
     get_session_stats,
     is_new_session,
     prune_old_messages,
+    prune_stale_facts,
     save_message,
+    get_facts,
+    delete_fact,
+    get_fact_count,
+    get_summary,
 )
-from llm import generate_final_response, generate_first_time_greeting
+from llm import generate_final_response, generate_first_time_greeting, summarize_session, extract_facts
 from prompts import (
     PRIVATE_FINAL_RESPONSE_PROMPT,
     PRIVATE_GREETING_PROMPT,
@@ -76,12 +82,17 @@ def get_self_chat_jid():
     return _self_chat_jid
 
 def is_self_chat(chat_jid, sender_id):
-    """True if this is a message in the bot's own self-chat."""
+    """True if this is a message in the bot's own self-chat.
+
+    A self-chat is the special "Message yourself" chat where the chat JID
+    equals the bot's own JID. In a regular DM, the chat JID is the OTHER
+    person's number, so it must never match -- even though sender == chat
+    in any 1:1 DM (that is the normal case, not a self-chat).
+    """
     chat_str = Jid2String(chat_jid) if hasattr(chat_jid, "User") else str(chat_jid)
-    if _self_chat_jid and chat_str == _self_chat_jid:
-        return True
-    # Fallback: a DM to yourself
-    return bool(sender_id) and sender_id == chat_str
+    if not _self_chat_jid:
+        return False
+    return chat_str == _self_chat_jid
 
 def get_bot_jid(client):
     """Return the bot's own JID (as a JID object) if available."""
@@ -182,9 +193,9 @@ def handle_reply_commands(client, chat, sender_id, text):
         value = val_raw in ("on", "true")
         ok, msg = toggle_setting(key, value)
         if ok:
-            client.send_message(chat, f"✓ {msg}\n\n" + status_text())
+            client.send_message(chat, f"[OK] {msg}\n\n" + status_text())
         else:
-            client.send_message(chat, f"✗ {msg}")
+            client.send_message(chat, f"[X] {msg}")
         return True
 
     if cmd in ("!status",):
@@ -301,7 +312,7 @@ def handle_commands(client: NewClient, chat, sender_id, text: str) -> bool:
     log.info(f"Command {text} from {sender_id} is allowed.")
     global is_bot_running
 
-    # Reply toggles + status (no delay — these are control commands)
+    # Reply toggles + status (no delay -- these are control commands)
     if handle_reply_commands(client, chat, sender_id, text):
         log.info(f"Processed reply-toggle command for {sender_id}.")
         return True
@@ -366,6 +377,9 @@ def handle_commands(client: NewClient, chat, sender_id, text: str) -> bool:
                     "!editprompt <prompt_name> <new_content> - Edit a prompt",
                     "!renamebot <new_name> - Change the bot's name",
                     "!memory - Show your session/memory stats",
+                    "!facts - List stored facts about you",
+                    "!forget <ID> - Delete a specific fact by ID",
+                    "!stats - Show full memory/stats overview",
                     "!reset - Clear your conversation history",
                     "!pause - Pause the bot",
                     "!resume - Resume the bot",
@@ -425,6 +439,51 @@ def handle_commands(client: NewClient, chat, sender_id, text: str) -> bool:
         client.send_message(chat, msg)
         log.info(f"Processed !memory command for {sender_id}.")
         return True
+    elif text.startswith("!facts"):
+        facts = get_facts(sender_id, limit=20)
+        if not facts:
+            client.send_message(chat, "[COMMAND] No facts stored yet.")
+            log.info(f"Processed !facts command for {sender_id} (empty).")
+            return True
+        lines = []
+        for fid, fact, entity, conf, created, confirmed in facts:
+            lines.append(f"[{fid}] ({entity}) {fact}")
+        client.send_message(chat, f"[COMMAND] Stored facts for {sender_id}:\n" + "\n".join(lines))
+        log.info(f"Processed !facts command for {sender_id} ({len(facts)} facts).")
+        return True
+    elif text.startswith("!forget"):
+        parts = text.split(" ", 1)
+        if len(parts) < 2:
+            client.send_message(chat, "[COMMAND] Provide the fact ID to delete. Use !facts to see IDs.")
+            return True
+        try:
+            fact_id = int(parts[1].strip())
+        except ValueError:
+            client.send_message(chat, f"[COMMAND] Invalid ID: {parts[1]}")
+            return True
+        if delete_fact(fact_id):
+            client.send_message(chat, f"[COMMAND] Fact [{fact_id}] deleted.")
+            log.info(f"Deleted fact {fact_id} for {sender_id}.")
+        else:
+            client.send_message(chat, f"[COMMAND] Fact [{fact_id}] not found.")
+        return True
+    elif text.startswith("!stats"):
+        stats = get_session_stats(sender_id)
+        fact_count = get_fact_count(sender_id)
+        summary_text, _ = get_summary(sender_id)
+        summary_size = len(summary_text) if summary_text else 0
+        gap_str = f"{stats['session_gap_seconds'] // 60} min ago" if stats['session_gap_seconds'] is not None else "never"
+        msg = (
+            f"[COMMAND] Stats for {sender_id}:\n"
+            f"- Messages: {stats['message_count']}\n"
+            f"- Facts stored: {fact_count}\n"
+            f"- Summary: {summary_size} chars\n"
+            f"- Last message: {gap_str}\n"
+            f"- Est. storage: {stats['estimated_bytes'] // 1024} KB"
+        )
+        client.send_message(chat, msg)
+        log.info(f"Processed !stats command for {sender_id}.")
+        return True
     elif text.startswith("!reset"):
         client.send_message(chat, "[COMMAND] Conversation history cleared!")
         delete_messages(sender_id)
@@ -462,7 +521,7 @@ def handle_final_response(client: NewClient, chat, sender_id, text, user_name: s
 
     is_relevant, response = call_watchdog_llm(text, private_prompts["watchdog"])
     if not is_relevant:
-        # Watchdog blocked the message — stay silent, no reply sent.
+        # Watchdog blocked the message -- stay silent, no reply sent.
         # (Old behavior: sent the watchdog's canned response to the user.)
         # # Calculate remaining delay time
         # elapsed = time.time() - start_time
@@ -546,6 +605,38 @@ def can_respond_to_user(user_id):
 def record_user_response(user_id):
     user_message_timestamps[user_id].append(time.time())
 
+def _extract_facts_async(user_id, user_message):
+    """Background thread: extract facts from a message without blocking the response."""
+    try:
+        extract_facts(user_id, user_message)
+    except Exception as e:
+        log.error(f"Fact extraction error for {user_id}: {e}")
+
+def _cleanup_thread():
+    """
+    Background thread: runs every 6 hours to prune old messages and stale facts.
+    Also logs a memory report.
+    """
+    CLEANUP_INTERVAL = 6 * 3600  # 6 hours
+    while True:
+        time.sleep(CLEANUP_INTERVAL)
+        try:
+            pruned_msgs = prune_old_messages()
+            pruned_facts = prune_stale_facts()
+            fact_count = get_fact_count()
+            log.info(
+                f"[CLEANUP] Pruned {pruned_msgs} old messages, {pruned_facts} stale facts. "
+                f"Total facts: {fact_count}."
+            )
+        except Exception as e:
+            log.error(f"[CLEANUP] Error: {e}")
+
+def start_cleanup_thread():
+    """Start the background cleanup thread (daemon)."""
+    t = threading.Thread(target=_cleanup_thread, daemon=True)
+    t.start()
+    log.info("Cleanup thread started (runs every 6h).")
+
 def on_message(client: NewClient, message: MessageEv):
     """
     Real-time incoming messages.
@@ -573,7 +664,24 @@ def on_message(client: NewClient, message: MessageEv):
         bot_jid = get_bot_jid(client)
         if _self_chat_jid is None and bot_jid:
             set_self_chat_jid(bot_jid)
+
+        # Resolve LID -> phone before the self-chat check.
+        # Self-chat JIDs from get_me() are phone-based, but incoming messages
+        # may carry a LID. Without this, is_self_chat() can't match.
+        sender_phone = resolve_sender_phone(client, chat)
+        if sender_phone and sender_phone != sender_id:
+            log.info(f"Resolved LID {sender_id} -> {sender_phone}")
+            sender_id = sender_phone
+
         is_self = is_self_chat(chat, sender_id)
+        # Fallback: compare phone parts (LID resolved) in case domain differs.
+        # Self-chat JID may have a ':N' device suffix (e.g. '628...:17@s.whatsapp.net')
+        # so strip that before comparing.
+        if not is_self and _self_chat_jid and sender_phone:
+            self_phone = _self_chat_jid.split("@", 1)[0].split(":", 1)[0]
+            if sender_phone == self_phone:
+                is_self = True
+                log.info(f"Self-chat matched by phone: {sender_phone}")
 
         # Note: in whatsmeow's event stream IsFromMe is true for ALL inbound
         # messages (both others' DMs and your own self-chat), so it cannot be
@@ -640,7 +748,8 @@ def on_message(client: NewClient, message: MessageEv):
             if handle_file(client, sender_id, message):
                 return
 
-        if not is_bot_running:
+        # Bot paused: self-chat still works in standby, others are skipped.
+        if not is_bot_running and not is_self:
             log.info("Bot is paused; skipping message processing.")
             return
 
@@ -650,8 +759,9 @@ def on_message(client: NewClient, message: MessageEv):
             sender_phone = resolve_sender_phone(client, message.Info.MessageSource.Sender or message.Info.MessageSource.Chat)
             if not sender_phone:
                 sender_phone = sender_id
-            # Normalize: strip '+', '@', and whitespace so format differences don't matter
-            norm = lambda s: s.strip().lstrip("+").replace("@", "")
+            # Normalize: strip '+', '@', ':N' device suffix, and whitespace so
+            # format differences (e.g. '6287711076107:52' vs '6287711076107') don't matter.
+            norm = lambda s: s.strip().lstrip("+").replace("@", "").split(":", 1)[0]
             sender_normalized = norm(sender_phone)
             whitelist_normalized = {norm(num) for num in REPLY_WHITELIST}
             if sender_normalized not in whitelist_normalized:
@@ -674,6 +784,19 @@ def on_message(client: NewClient, message: MessageEv):
             pruned = prune_old_messages(sender_id)
             if pruned:
                 log.info(f"Pruned {pruned} old messages for {sender_id}.")
+
+        # Phase 2: Summarize older messages if the conversation exceeds the verbatim tail.
+        # This keeps the context window within budget while preserving long-term memory.
+        if not is_first and stats["message_count"] > VERBATIM_TURNS:
+            summarize_session(sender_id)
+
+        # Phase 3: Extract facts asynchronously (non-blocking).
+        # Runs in a background thread so it doesn't delay the user's response.
+        threading.Thread(
+            target=_extract_facts_async,
+            args=(sender_id, text),
+            daemon=True
+        ).start()
 
         # Process greeting for a first-time message
         if is_first:

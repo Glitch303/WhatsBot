@@ -1,6 +1,6 @@
 import sqlite3
 import time
-from config import CONV_DB_PATH, MAX_MESSAGES, VERBATIM_TURNS, MEMORY_CUTOFF_DAYS, SESSION_GAP_SECONDS
+from config import CONV_DB_PATH, MAX_MESSAGES, VERBATIM_TURNS, MEMORY_CUTOFF_DAYS, FACT_CUTOFF_DAYS, SESSION_GAP_SECONDS
 
 def init_db():
     """Initialize the SQLite database with a unique constraint."""
@@ -16,6 +16,24 @@ def init_db():
             timestamp INTEGER,
             from_me BOOLEAN,
             UNIQUE(user_id, message_content, timestamp, from_me)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS summaries (
+            user_id TEXT PRIMARY KEY,
+            summary_text TEXT,
+            last_summarized_timestamp INTEGER
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            fact TEXT,
+            entity TEXT,
+            confidence REAL DEFAULT 0.5,
+            created_at INTEGER,
+            last_confirmed INTEGER
         )
     """)
     conn.commit()
@@ -128,7 +146,7 @@ def get_session_start(user_id, now=None):
     conn.close()
     if row and row[0] is not None:
         return row[0]
-    # No recent messages — check if there are any at all (for first-time detection)
+    # No recent messages -- check if there are any at all (for first-time detection)
     conn = sqlite3.connect(CONV_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
@@ -231,6 +249,153 @@ def prune_old_messages(user_id=None, cutoff_days=None):
         cursor.execute("DELETE FROM messages WHERE user_id = ? AND timestamp < ?", (user_id, cutoff))
     else:
         cursor.execute("DELETE FROM messages WHERE timestamp < ?", (cutoff,))
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+# --- Conversation summary helpers (Phase 2) ---
+
+def save_summary(user_id, summary_text, last_summarized_timestamp):
+    """Upsert a conversation summary for a user."""
+    conn = sqlite3.connect(CONV_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO summaries (user_id, summary_text, last_summarized_timestamp)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            summary_text = excluded.summary_text,
+            last_summarized_timestamp = excluded.last_summarized_timestamp
+    """, (user_id, summary_text, last_summarized_timestamp))
+    conn.commit()
+    conn.close()
+
+
+def get_summary(user_id):
+    """
+    Return (summary_text, last_summarized_timestamp) for a user, or (None, None).
+    """
+    conn = sqlite3.connect(CONV_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT summary_text, last_summarized_timestamp FROM summaries WHERE user_id = ?
+    """, (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return row[0], row[1]
+    return None, None
+
+
+def get_messages_since(user_id, since_timestamp):
+    """
+    Return messages for a user with timestamp > since_timestamp,
+    ordered oldest to newest. Used to build the summarization input.
+    """
+    conn = sqlite3.connect(CONV_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT message_content, timestamp, from_me
+        FROM messages
+        WHERE user_id = ? AND timestamp > ?
+        ORDER BY timestamp ASC
+    """, (user_id, since_timestamp))
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+
+# --- Fact extraction helpers (Phase 3) ---
+
+def save_fact(user_id, fact, entity, confidence, now=None):
+    """
+    Insert a fact, or update the existing one if (user_id, entity, normalized fact) matches.
+    Returns the fact ID.
+    """
+    if now is None:
+        now = int(time.time())
+    conn = sqlite3.connect(CONV_DB_PATH)
+    cursor = conn.cursor()
+    # Check for existing fact with same user + entity + similar text
+    cursor.execute("""
+        SELECT id FROM facts
+        WHERE user_id = ? AND entity = ? AND fact = ?
+    """, (user_id, entity, fact))
+    row = cursor.fetchone()
+    if row:
+        # Update confidence and last_confirmed
+        cursor.execute("""
+            UPDATE facts SET confidence = ?, last_confirmed = ? WHERE id = ?
+        """, (max(confidence, row[0]), now, row[0]))
+        conn.commit()
+        conn.close()
+        return row[0]
+    else:
+        cursor.execute("""
+            INSERT INTO facts (user_id, fact, entity, confidence, created_at, last_confirmed)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (user_id, fact, entity, confidence, now, now))
+        conn.commit()
+        fact_id = cursor.lastrowid
+        conn.close()
+        return fact_id
+
+
+def get_facts(user_id, limit=10):
+    """
+    Return the most recent/relevant facts for a user, ordered by last_confirmed DESC.
+    Returns list of (id, fact, entity, confidence, created_at, last_confirmed).
+    """
+    conn = sqlite3.connect(CONV_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, fact, entity, confidence, created_at, last_confirmed
+        FROM facts
+        WHERE user_id = ?
+        ORDER BY last_confirmed DESC
+        LIMIT ?
+    """, (user_id, limit))
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+
+def delete_fact(fact_id):
+    """Delete a fact by ID. Returns True if a row was deleted."""
+    conn = sqlite3.connect(CONV_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM facts WHERE id = ?", (fact_id,))
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return deleted > 0
+
+
+def get_fact_count(user_id=None):
+    """Return total fact count (all users if user_id is None)."""
+    conn = sqlite3.connect(CONV_DB_PATH)
+    cursor = conn.cursor()
+    if user_id:
+        cursor.execute("SELECT COUNT(*) FROM facts WHERE user_id = ?", (user_id,))
+    else:
+        cursor.execute("SELECT COUNT(*) FROM facts")
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+
+def prune_stale_facts(cutoff_days=None):
+    """
+    Delete facts where last_confirmed is older than cutoff_days.
+    Returns the number of rows deleted.
+    """
+    if cutoff_days is None:
+        cutoff_days = FACT_CUTOFF_DAYS
+    cutoff = int(time.time()) - (cutoff_days * 86400)
+    conn = sqlite3.connect(CONV_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM facts WHERE last_confirmed < ?", (cutoff,))
     deleted = cursor.rowcount
     conn.commit()
     conn.close()
