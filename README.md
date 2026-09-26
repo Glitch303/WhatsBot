@@ -158,7 +158,7 @@ llama-swap -port 8080 -m ./models
 # In .env:
 LLM_PROVIDER=llamacpp
 LLAMACPP_BASE_URL=http://localhost:8080/v1
-LLAMACPP_MODEL=Qwen3.8-Orca-27B-Instruct
+LLAMACPP_MODEL=Qwen3.8-27B-Instruct
 ```
 
 ---
