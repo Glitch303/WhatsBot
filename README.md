@@ -153,11 +153,11 @@ The first time you run it, the menu will show a QR code. Scan it with WhatsApp â
 # Download a GGUF model (e.g. from HuggingFace) into the models directory
 
 # Start the server (auto-loads models on demand):
-llama-swap -port 27906 -m ./models
+llama-swap -port 8080 -m ./models
 
 # In .env:
 LLM_PROVIDER=llamacpp
-LLAMACPP_BASE_URL=http://localhost:27906/v1
+LLAMACPP_BASE_URL=http://localhost:8080/v1
 LLAMACPP_MODEL=Qwen3.8-Orca-27B-Instruct
 ```
 
@@ -340,7 +340,7 @@ For deeper technical detail, see:
 
 ### LLM errors
 - Check `app.log` for "Error calling LLM API". Common causes: model not loaded, server unreachable, API key invalid.
-- For `llamacpp`, verify the server is running: `curl http://localhost:27906/v1/models`.
+- For `llamacpp`, verify the server is running: `curl http://localhost:8080/v1/models`.
 
 ### Messages from history sync
 - On first connect, Whatsmeow syncs conversation history. These are saved to the DB but **not** processed for replies (only real-time messages are).
