@@ -376,7 +376,7 @@ def prompt_model_choice():
                 set_runtime("model", model)
                 set_runtime("base_url", None)
             elif choice == "llamacpp":
-                url = input(c(C.CYAN, "  Server URL (default http://localhost:27906/v1): ") or LLAMACPP_BASE_URL).strip()
+                url = input(c(C.CYAN, "  Server URL (default http://localhost:8080/v1): ") or LLAMACPP_BASE_URL).strip()
                 _heal_terminal()
                 set_runtime("base_url", url)
 
