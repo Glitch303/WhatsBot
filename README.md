@@ -4,6 +4,8 @@ A personal WhatsApp AI assistant that runs on a local LLM (or any OpenAI-compati
 
 Built on top of [Neonize](https://github.com/krypton-byte/neonize) (a Python wrapper for [Whatsmeow](https://github.com/tulir/whatsmeow)) and the OpenAI Python SDK.
 
+> **Provenance** — This project is based on the original [GPT-Laboratory / whatsapp-ai-chatbot](https://github.com/GPT-Laboratory/whatsapp-ai-chatbot) by the GPT Lab Seinäjoki / Tampere University team. See [Acknowledgments](#acknowledgments) for full credit.
+
 ---
 
 ## Table of Contents
