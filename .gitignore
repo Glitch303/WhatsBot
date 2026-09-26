@@ -174,3 +174,7 @@ cython_debug/
 /converted
 
 .env.*
+
+# Personalized prompts (your own persona/config) — keep private.
+# A public template lives in prompts_example.py.
+prompts.py

@@ -132,9 +132,17 @@ pip install -r requirements.txt
 cp example.env .env
 # Edit .env — set ASSISTANT_NAME, ADMIN_NUMBERS, and your LLM provider
 
-# 5. Start
+# 5. Copy the example prompt file (prompts.py is gitignored — create your own)
+cp prompts_example.py prompts.py
+# Edit prompts.py — customize the assistant persona, name, speech style, etc.
+
+# 6. Start
 python main.py
 ```
+
+> **Note:** `prompts.py` is intentionally **gitignored** so your personal persona and
+> configuration stay private. The public template is `prompts_example.py` — copy it to
+> `prompts.py` on first run (step 5 above) and edit from there.
 
 The first time you run it, the menu will show a QR code. Scan it with WhatsApp → **Settings → Linked Devices → Link a Device**.
 
@@ -280,7 +288,8 @@ WhatsBot/
 ├── bot_settings.py      # Thread-safe runtime settings (dm, group_mention, self_chat)
 ├── database.py          # SQLite: messages, summaries, facts tables + helpers
 ├── llm.py              # LLM provider client, watchdog, summary, fact extraction, context builder
-├── prompts.py           # All system prompts (public editable + private)
+├── prompts_example.py   # Public template — copy to prompts.py and customize
+├── prompts.py           # Your personal prompts (gitignored — create from example)
 ├── requirements.txt     # Dependencies
 ├── .env                 # Environment config (gitignored)
 ├── example.env          # Template for .env
