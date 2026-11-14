@@ -209,7 +209,8 @@ def print_standby_menu(provider, connected):
         items.append(("4", "Start bot (connected)"))
     else:
         items.append(("4", "Start bot"))
-    items.append(("5", "Quit"))
+    items.append(("5", "Sessions"))
+    items.append(("6", "Quit"))
 
     for num, label in items:
         print(f"    [{num}] {label}")
@@ -400,8 +401,9 @@ def prompt_model_choice():
 def print_settings_menu():
     from bot_settings import get_settings
     from config import (
-        VERBATIM_TURNS, CONTEXT_CHAR_BUDGET, MAX_FACTS_IN_CONTEXT,
+        VERBATIM_TURNS, MAX_FACTS_IN_CONTEXT,
         SESSION_GAP_SECONDS, MEMORY_CUTOFF_DAYS, MAX_REPLY_TOKENS,
+        FACT_CUTOFF_DAYS,
     )
     s = get_settings()
     print()
@@ -410,9 +412,9 @@ def print_settings_menu():
     print(f"    Group @mention:   {'ON' if s['group_mention'] else 'off'}")
     print(f"    Self-chat:        {'ON' if s['self_chat'] else 'off'}")
     print()
-    print(c(C.DIM, f"  Context: {VERBATIM_TURNS} verbatim turns, {CONTEXT_CHAR_BUDGET} char budget"))
-    print(c(C.DIM, f"  Facts: max {MAX_FACTS_IN_CONTEXT} in context, prune after {MEMORY_CUTOFF_DAYS}d"))
-    print(c(C.DIM, f"  Session gap: {SESSION_GAP_SECONDS}s, reply cap: {MAX_REPLY_TOKENS} tokens"))
+    print(c(C.DIM, f"  Context: {VERBATIM_TURNS} verbatim turns per session, rolling summary beyond that"))
+    print(c(C.DIM, f"  Facts: max {MAX_FACTS_IN_CONTEXT} in context, prune after {FACT_CUTOFF_DAYS}d"))
+    print(c(C.DIM, f"  Messages: prune after {MEMORY_CUTOFF_DAYS}d, session gap: {SESSION_GAP_SECONDS}s, reply cap: {MAX_REPLY_TOKENS} tokens"))
     print()
 
 def toggle_setting(key):
@@ -446,6 +448,27 @@ def handle_settings_menu():
             toggle_setting("self_chat")
         elif choice == 4:
             return
+
+def print_sessions_menu():
+    """Session ledger overview (like `discordbot sessions status`)."""
+    from sessionstore import store
+    s = store.stats()
+    print()
+    print(c(C.BOLD, "  Sessions:"))
+    print(f"    Total:    {s['total_sessions']} ({s['named_sessions']} named)")
+    print(f"    Messages: {s['total_messages']}")
+    print()
+    if not s["bindings"]:
+        print(c(C.DIM, "    No sessions yet."))
+        return
+    print(c(C.DIM, "    Current session per chat:"))
+    for b in s["bindings"]:
+        state = "active" if b["ended_at"] is None else "ended"
+        last = time.strftime("%Y-%m-%d %H:%M", time.localtime(b["last_activity_at"])) if b["last_activity_at"] else "-"
+        title = b["title"] or "(untitled)"
+        print(f"    {b['session_key']}: {b['id']} {title} "
+              f"({b['message_count']} msgs, {state}, last {last})")
+    print()
 
 # --- Live log view ---
 _live_running = False
@@ -682,7 +705,13 @@ def run_menu(connect_fn, start_bot_fn, disconnect_fn, stop_bot_fn):
                 stop_bot_fn()
             else:
                 print(c(C.YELLOW, "  Session not connected. Choose [3] Connect first."))
-        elif choice == 5:  # Quit
+        elif choice == 5:  # Sessions
+            print_sessions_menu()
+            try:
+                input(c(C.DIM, "  Press Enter to return..."))
+            except (EOFError, KeyboardInterrupt):
+                pass
+        elif choice == 6:  # Quit
             if connected:
                 disconnect_fn()
             print(c(C.CYAN, "\n  Goodbye!"))

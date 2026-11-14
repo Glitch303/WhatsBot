@@ -1,243 +1,172 @@
 # Memory System
 
-How the bot's conversation memory, summarization, fact extraction, and session detection work.
+How the bot's conversation memory, sessions, summarization, and fact extraction work.
 
 ---
 
 ## Overview
 
-The bot maintains three layers of context for each user, all stored in SQLite (`db/conversations.sqlite3`):
+The bot keeps **one session per chat** (DM, self-chat, or group) in SQLite (`db/conversations.sqlite3`). Every LLM call sends:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Context Window                           │
-│                   (CONTEXT_CHAR_BUDGET)                     │
-│                                                             │
-│  ┌──────────────┐   ┌──────────────────┐   ┌─────────────┐ │
-│  │   FACTS      │   │  SUMMARY         │   │  VERBATIM   │ │
-│  │  (25% budget)│   │ (50% remaining)  │   │  TAIL       │ │
-│  │              │   │                  │   │ (rest)      │ │
-│  │ - user's     │   │ Rolling LLM-     │   │ Last N      │ │
-│  │   name       │   │ generated        │   │ messages    │ │
-│  │ - lives in   │   │ summary of older │   │ (exact     │ │
-│  │   Jakarta    │   │ messages         │   │  text)     │ │
-│  │ - prefers    │   │                  │   │             │ │
-│  │   dark anime │   │ "User and Yuki  │   │ USER: hi    │ │
-│  │              │   │  discussed anime│   │ ASSISTANT:  │ │
-│  │              │   │  last week..."   │   │   onii-chan!│ │
-│  └──────────────┘   └──────────────────┘   └─────────────┘ │
+│  system prompt                                              │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │ SOUL.md persona (re-read on every message)            │  │
+│  │ + owner note (DM) or group-chat note (groups)         │  │
+│  │ + session note (first-ever / "new session, ended Xh") │  │
+│  │ + [FACTS about this user] (per-user, durable)         │  │
+│  │ + [CONVERSATION SUMMARY] (per-session, rolling)       │  │
+│  │ + [ADDITIONAL CONTENT] (converted/ file uploads)      │  │
+│  └───────────────────────────────────────────────────────┘  │
+│  history: last VERBATIM_TURNS user turns + replies          │
+│            (in groups, user messages carry [Name] labels)   │
+│  current user turn                                          │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+There is no character budget: the context is the persona + memory blocks + a fixed-size verbatim tail. Older messages are folded into the rolling summary instead of being dropped.
+
+---
+
+## Sessions
+
+### Session keys
+
+| Key | Chat type |
+|-----|-----------|
+| `dm-{phone}` | One session lineage per DM |
+| `self` | The bot's own self-chat |
+| `ch-{group jid}` | Shared group session (all speakers, `[Name]` labels) |
+
+Each chat has exactly one **active** session (the `chat_sessions` binding). Ending a session (`!new`, `!reset`) creates a new one; the old one stays in the ledger, resumable with `!resume`.
+
+### Lifecycle
+
+```
+ensure_session(key)          → return the active session, or create one
+append(session_id, ...)      → store a message, bump last_activity_at
+end_current(key, reason)     → end the active session + create a fresh one
+resume(key, session_id)      → rebind the chat to a previous session
+delete_session(key, id)      → delete a session (bound → create replacement)
+reset_key(key)               → delete all sessions for the chat + fresh bind
+```
+
+Session rows keep lineage: `parent_session_id` points to the previous session in the chat's chain, and `end_reason` records why it ended (`new`, `reset`, `superseded_by_resume`, …).
+
+### Titles
+
+Sessions are untitled by default. `!title` sets one (`title_source='user'`); the ledger and `!sessions` show them. `!sessions`/`!resume`/`!delete` accept a list number, a title (exact or partial), or a session ID (full or `s-` prefix).
 
 ---
 
 ## Database Schema
 
-### `messages` table
+### `sessions` table
 
-Stores all conversation messages (both user and bot).
+```sql
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,            -- "s-" + 12 hex chars
+    session_key TEXT NOT NULL,      -- dm-{phone} | self | ch-{group jid}
+    user_id TEXT,                   -- owner phone (DMs/self) or last actor
+    title TEXT,
+    title_source TEXT DEFAULT '',   -- 'user' when set via !title
+    parent_session_id TEXT,         -- previous session in the chat's chain
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    end_reason TEXT,
+    last_activity_at REAL NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_sessions_key ON sessions(session_key, last_activity_at DESC);
+CREATE INDEX idx_sessions_title ON sessions(title);
+```
+
+### `messages` table
 
 ```sql
 CREATE TABLE messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,             -- 'user' | 'assistant'
+    content TEXT NOT NULL,          -- plain text (group sender is in `sender`)
+    timestamp REAL NOT NULL,
     user_id TEXT,
-    message_content TEXT,
-    timestamp INTEGER,      -- unix seconds
-    from_me BOOLEAN,        -- True = bot, False = user
-    UNIQUE(user_id, message_content, timestamp, from_me)
+    sender TEXT                     -- display name (groups; view-time [Name] label source)
 );
+CREATE INDEX idx_messages_session ON messages(session_id, id);
 ```
 
-- `from_me=True` → bot's response (speaker: ASSISTANT)
-- `from_me=False` → user's message (speaker: USER)
-- The `UNIQUE` constraint prevents duplicate inserts (same user + content + timestamp + direction).
+### `chat_sessions` table
+
+```sql
+CREATE TABLE chat_sessions (
+    session_key TEXT PRIMARY KEY,   -- one active session per chat
+    session_id TEXT NOT NULL
+);
+```
 
 ### `summaries` table
 
-Stores the rolling conversation summary per user.
-
 ```sql
 CREATE TABLE summaries (
-    user_id TEXT PRIMARY KEY,
-    summary_text TEXT,
-    last_summarized_timestamp INTEGER  -- unix seconds
+    session_id TEXT PRIMARY KEY,    -- per session (not per user)
+    summary_text TEXT NOT NULL,
+    last_summarized_timestamp REAL NOT NULL
 );
 ```
 
-- One row per user (upserted on each summarization).
-- `last_summarized_timestamp` tracks how far the summary has progressed. New messages after this timestamp are candidates for the next summarization.
-
 ### `facts` table
-
-Stores durable extracted facts per user.
 
 ```sql
 CREATE TABLE facts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT,
     fact TEXT,
-    entity TEXT,            -- normalized (lowercase, no punctuation)
-    confidence REAL DEFAULT 0.5,  -- 0.0 to 1.0
-    created_at INTEGER,     -- unix seconds
-    last_confirmed INTEGER  -- unix seconds (updated on re-extraction)
+    entity TEXT,
+    confidence REAL DEFAULT 0.5,
+    created_at INTEGER,
+    last_confirmed INTEGER
 );
 ```
 
-- Facts are upserted: if the same `(user_id, entity, fact)` is found, `confidence` is updated to `max(old, new)` and `last_confirmed` is refreshed.
-- This means repeated facts get higher confidence over time.
+---
+
+## Context Assembly (`llm.build_convo`)
+
+For each reply, the conversation is assembled as:
+
+1. **System prompt** (`build_system_prompt`):
+   - `SOUL.md` content (re-read from disk on every message — edits apply live; falls back to a generic persona if the file is missing/empty).
+   - **DMs:** an owner note — "The person messaging you right now is your owner: {OWNER_NAME}. Use your private face." or "Your owner is {OWNER_NAME}. The person messaging you right now is not them. Use your public face."
+   - **Groups:** the group-chat note (`[Name]` labels explained, only speak when @mentioned, pronouns point at the speaker) + an `## Owner` section.
+   - **Session note** (when applicable): "This is the user's first message ever." or "New session. Last conversation ended X hours ago." (when the session's last activity is older than `SESSION_GAP_SECONDS`).
+   - **Facts** (`[FACTS about this user]`): the `MAX_FACTS_IN_CONTEXT` most recently confirmed facts for the sender.
+   - **Summary** (`[CONVERSATION SUMMARY]`): the session's rolling summary, if any.
+   - **Files** (`[ADDITIONAL CONTENT]`): concatenated text of everything in `converted/` (admin uploads).
+2. **History** (`store.history`): the last `VERBATIM_TURNS` *user turns* and the assistant replies between them, oldest first. In group sessions, user messages are prefixed with `[Sender]` at view time (stored content stays clean). Consecutive identical assistant replies are collapsed, and a leading assistant run is dropped so the history always starts with a user message.
+3. **Current turn**: the incoming message. In groups it is labeled `[Name] text` plus a face note: "(You are replying to your owner. Private face.)" or "(…not your owner. Public face.)".
+
+Owner detection (`llm.is_owner`): exact phone match against `OWNER_NUMBER` when set, otherwise pushname match against `OWNER_NAME`. Self-chat is always the owner.
 
 ---
 
-## Session Detection
+## Rolling Summary
 
-A "session" is a continuous conversation. A new session starts when the user is silent for more than `SESSION_GAP_SECONDS` (default 3600 = 1 hour).
+When a session's user-turn count exceeds `VERBATIM_TURNS`, the bot summarizes the messages that just fell out of the verbatim window:
 
-### `is_new_session(user_id)`
+1. `store.oldest_tail_timestamp(session_id, VERBATIM_TURNS)` — timestamp of the oldest message still in the window.
+2. `store.messages_since(session_id, since_ts)` — everything older than that (excluding the tail), formatted as `USER:` / `ASSISTANT:` lines.
+3. The LLM merges them into the existing summary (`SUMMARY_SYSTEM_PROMPT`, same language as the conversation, < 200 words) — capped at 1200 chars.
+4. `store.save_summary(session_id, text, max_ts)`.
 
-Returns `(is_new_session, is_first_ever)`:
-
-| Condition | `is_new_session` | `is_first_ever` |
-|-----------|-----------------|-----------------|
-| No messages in DB | `True` | `True` |
-| Last message > `SESSION_GAP_SECONDS` ago | `True` | `False` |
-| Last message within gap | `False` | `False` |
-
-### How it's used
-
-When a message arrives:
-
-```python
-is_new, is_first = is_new_session(sender_id)
-stats = get_session_stats(sender_id)
-```
-
-- **`is_first=True`**: First-ever message → `handle_greeting()` (special greeting prompt).
-- **`is_new=True` (not first)**: Returning after a gap → the LLM is told "New session. Last conversation ended X hours ago."
-- **`is_new=False`**: Ongoing session → the LLM is told "Ongoing session (X min active, Y total messages)."
-
-### `get_session_stats(user_id)`
-
-Returns a dict of session statistics:
-
-```python
-{
-    "user_id": "6281234567890",
-    "message_count": 42,
-    "session_start": 1727268000,
-    "last_message_time": 1727271600,
-    "session_age_seconds": 3600,
-    "session_gap_seconds": 120,
-    "is_new_session": False,
-    "is_first_ever": False,
-    "estimated_bytes": 3072,
-}
-```
+Summaries are **per session**: `!new`/`!reset` start with a blank summary; `!resume` restores the resumed session's summary.
 
 ---
 
-## Context Building (`build_context`)
+## Fact Extraction
 
-When generating a response, `build_context()` assembles the context from three layers within a character budget:
-
-```python
-def build_context(user_id, current_message, char_budget=None):
-    if char_budget is None:
-        char_budget = CONTEXT_CHAR_BUDGET  # default 2000
-
-    # 1. Get verbatim tail (last VERBATIM_TURNS messages)
-    tail = get_verbatim_tail(user_id, VERBATIM_TURNS)  # default 10
-
-    # 2. Get facts (most recent, max MAX_FACTS_IN_CONTEXT)
-    facts = get_facts(user_id, MAX_FACTS_IN_CONTEXT)   # default 8
-
-    # 3. Get summary
-    summary_text, _ = get_summary(user_id)
-
-    # 4. Budget allocation:
-    #    reserved = len(current_message) + 60 (separators)
-    #    available = char_budget - reserved
-    #
-    #    facts:    25% of available (highest priority)
-    #    summary:  50% of remaining
-    #    tail:     rest of budget
-
-    # 5. Walk tail from newest to oldest, accumulating until budget hit
-    # 6. Return: "[FACTS]\n..." + "[CONVERSATION SUMMARY]\n..." + tail lines
-```
-
-### Budget Allocation Example
-
-With `CONTEXT_CHAR_BUDGET=2000` and a 200-char current message:
-
-```
-reserved   = 200 + 60 = 260
-available  = 2000 - 260 = 1740
-
-facts:     1740 // 4 = 435 chars
-summary:  (1740 - 435) // 2 = 652 chars
-tail:     1740 - 435 - 652 = 653 chars
-```
-
-### Truncation Rules
-
-- **Facts**: If the facts text exceeds 25% of available, it's truncated to fit.
-- **Summary**: Capped at 50% of remaining (after facts). Also hard-capped at 1200 chars during generation.
-- **Tail**: Lines are added from newest to oldest until the budget is hit. Oldest messages in the tail may be dropped.
-
----
-
-## Summarization (`summarize_session`)
-
-When `message_count > VERBATIM_TURNS`, older messages are summarized:
-
-```
-messages: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-                                              ^^^^^^^^^^^^
-                                              verbatim tail (10)
-                ^^^^^^^^^^^^
-                summarized into rolling summary
-```
-
-### Process
-
-1. Get the verbatim tail (last `VERBATIM_TURNS` messages).
-2. Get the existing summary (if any).
-3. Find messages older than the tail that haven't been summarized yet (`timestamp > last_summarized_timestamp`).
-4. Exclude messages already in the verbatim tail.
-5. If there are messages to summarize, call the LLM with `SUMMARY_SYSTEM_PROMPT`.
-6. Merge the result with the existing summary (the LLM is instructed to merge, not replace).
-7. Cap at 1200 chars.
-8. Save with `last_summarized_timestamp = max(timestamp of summarized messages)`.
-
-### Summary Prompt
-
-```
-You are a conversation summarizer. Your task is to update a rolling summary.
-Rules:
-- Write in the same language as the conversation.
-- Keep the summary under 200 words.
-- Focus on: key facts, decisions, preferences, ongoing topics, unresolved threads.
-- Drop trivial pleasantries.
-- If there is an existing summary, MERGE it with the new messages.
-- Be concise and factual.
-```
-
-### When it runs
-
-```python
-if not is_first and stats["message_count"] > VERBATIM_TURNS:
-    summarize_session(sender_id)
-```
-
-- Skipped for first-ever messages (nothing to summarize).
-- Skipped if there are no new messages to summarize (already summarized up to the latest).
-- Runs synchronously (blocks the response). This is acceptable because it only triggers when the conversation exceeds the verbatim window, and the LLM call is typically 1-3s.
-
----
-
-## Fact Extraction (`extract_facts`)
-
-Runs in a **background thread** (non-blocking) for every non-command, non-file message:
+Facts are extracted in a **background thread** (non-blocking) for every non-command, non-file message:
 
 ```python
 threading.Thread(
@@ -278,6 +207,10 @@ Format: [{"fact": "...", "entity": "...", "confidence": 0.8}]
 - **0.5-0.8**: Implied fact ("I'll be in Jakarta next week" → "user plans to visit Jakarta")
 - Facts are upserted: if the same fact is extracted again, confidence becomes `max(old, new)` and `last_confirmed` is refreshed.
 
+### Scope
+
+Facts are **per user** (phone number), not per session — they follow the person across sessions and chats, and are injected into the system prompt for that user.
+
 ### Pruning
 
 Facts whose `last_confirmed` is older than `FACT_CUTOFF_DAYS` (default 60) are pruned by the cleanup thread. This means facts that are never re-confirmed eventually disappear.
@@ -289,12 +222,12 @@ Facts whose `last_confirmed` is older than `FACT_CUTOFF_DAYS` (default 60) are p
 ### Message pruning
 
 ```python
-def prune_old_messages(user_id=None, cutoff_days=None):
-    cutoff = int(time.time()) - (cutoff_days * 86400)
-    DELETE FROM messages WHERE timestamp < ?
+def prune_old_messages(session_id=None, cutoff_days=None):
+    cutoff = time.time() - (cutoff_days * 86400)
+    DELETE FROM messages WHERE timestamp < ?   -- (+ session_id filter)
 ```
 
-- Triggered per-user when `message_count > 100` (in the message pipeline).
+- Triggered per-session when `message_count > 100` (in the message pipeline).
 - Also run globally every 6 hours by the cleanup thread.
 - Default cutoff: `MEMORY_CUTOFF_DAYS` = 30 days.
 
@@ -302,7 +235,7 @@ def prune_old_messages(user_id=None, cutoff_days=None):
 
 ```python
 def prune_stale_facts(cutoff_days=None):
-    cutoff = int(time.time()) - (cutoff_days * 86400)
+    cutoff = time.time() - (cutoff_days * 86400)
     DELETE FROM facts WHERE last_confirmed < ?
 ```
 
@@ -316,7 +249,7 @@ def _cleanup_thread():
     CLEANUP_INTERVAL = 6 * 3600  # 6 hours
     while True:
         time.sleep(CLEANUP_INTERVAL)
-        prune_old_messages()
+        store.prune_old_messages()
         prune_stale_facts()
         log.info(f"[CLEANUP] Pruned ...")
 ```
@@ -343,7 +276,13 @@ def can_respond_to_user(user_id):
 
 - Max **5 responses per user per 30-second window**.
 - Timestamps are in-memory (lost on restart).
-- `record_user_response()` is called after each successful response (greeting or final).
+- `record_user_response()` is called after each successful response.
+
+---
+
+## Storage
+
+The store keeps **one persistent SQLite connection** (WAL mode) guarded by a re-entrant lock — neonize event callbacks and background threads share it. No per-call connect/close.
 
 ---
 
@@ -352,22 +291,21 @@ def can_respond_to_user(user_id):
 ```
 User message
     │
-    ├──► save_message()          → messages table
+    ├──► store.ensure_session(key)   → active session for this chat
+    ├──► store.append(user msg)      → messages table
     │
-    ├──► is_new_session()        → session detection
+    ├──► _session_note()             → first-ever / new-session note
+    ├──► store.prune_old_messages()  → if message_count > 100
+    ├──► summarize_session()         → if user turns > VERBATIM_TURNS
+    │       └──► store.save_summary()
     │
-    ├──► get_session_stats()     → stats for prompt
+    ├──► extract_facts()             → background thread
+    │       └──► save_fact()         → facts table
     │
-    ├──► prune_old_messages()    → if > 100 messages
-    │
-    ├──► summarize_session()     → if > VERBATIM_TURNS
-    │       └──► save_summary()  → summaries table
-    │
-    ├──► extract_facts()         → background thread
-    │       └──► save_fact()     → facts table
-    │
-    └──► build_context()         → assemble context
-            ├── get_facts()      ← facts table
-            ├── get_summary()    ← summaries table
-            └── get_verbatim_tail() ← messages table
+    └──► build_convo()               → assemble the LLM conversation
+            ├── load_soul()          ← SOUL.md (fresh read)
+            ├── get_facts()          ← facts table (per user)
+            ├── store.get_summary()  ← summaries table (per session)
+            ├── store.history()      ← messages table (verbatim tail)
+            └── converted/ files     ← admin uploads
 ```

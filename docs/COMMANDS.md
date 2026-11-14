@@ -22,14 +22,17 @@ List all available commands.
 !commands - Show available commands
 !files - List files in the downloads folder
 !removefile <ID or filename> - Remove a file from the downloads folder
-!prompts - Show available prompts
-!editprompt <prompt_name> <new_content> - Edit a prompt
 !renamebot <new_name> - Change the bot's name
+!new - Start a new session (previous one stays saved, resumable)
+!title [name] - Set/show the title of the current session
+!sessions [search] - List sessions for this chat (optionally search)
+!resume <n|name|id> - Resume a previous session
+!delete <n|name|id> - Delete a session
 !memory - Show your session/memory stats
 !facts - List stored facts about you
 !forget <ID> - Delete a specific fact by ID
 !stats - Show full memory/stats overview
-!reset - Clear your conversation history
+!reset - Delete all sessions for this chat (fresh start)
 !pause - Pause the bot
 !resume - Resume the bot
 !permanentstop - Stop the bot permanently
@@ -82,71 +85,126 @@ Remove a file from `downloads/` and its converted `.txt` from `converted/`.
 
 ---
 
-### `!prompts`
-
-Show the current editable (public) prompts.
-
-```
-!prompts
-```
-
-**Response:**
-```
-[COMMAND] Public prompts (editable):
-
-greeting:
-Hi! I'm here.
-
-final_response:
-Say farewell to "USER_NAME_HERE".
-```
-
-> Private prompts (personality, watchdog, summarization, fact extraction) are not editable at runtime.
-
----
-
-### `!editprompt <name> <new_content>`
-
-Edit a public prompt. The change is immediate (applies to the next response). Resets on restart.
-
-```
-!editprompt greeting Hello! How are you, USER_NAME_HERE?
-!editprompt final_response Goodbye, USER_NAME_HERE! See you soon.
-```
-
-**Response:**
-```
-[COMMAND] Public prompt greeting updated.
-```
-
-**Errors:**
-```
-[COMMAND] Provide the prompt name and new content.
-[COMMAND] Unknown prompt name: foo
-```
-
-**Valid prompt names:** `greeting`, `final_response`
-
----
-
 ### `!renamebot <new_name>`
 
-Change the bot's display name (cosmetic only — updates the log, doesn't change the WhatsApp profile name).
+Change the bot's display name (sent to the current chat).
 
 ```
 !renamebot Yuki
 ```
 
+---
+
+### `!new`
+
+End the current session and start a fresh one. The previous session is kept in the ledger (resumable with `!resume`).
+
+```
+!new
+```
+
 **Response:**
 ```
-[COMMAND] Bot name updated: Yuki.
+[COMMAND] New session started. Previous session saved (use !sessions to see it).
+```
+
+---
+
+### `!title [name]`
+
+Set the title of the current session, or show it when no name is given.
+
+```
+!title planning the trip
+!title
+```
+
+**Response:**
+```
+[COMMAND] Session title set to: planning the trip
+```
+or
+```
+[COMMAND] Current session title: (untitled)
+```
+
+---
+
+### `!sessions [search]`
+
+List the session ledger for this chat (newest first, up to 15). Optionally filter by title/search text.
+
+```
+!sessions
+!sessions trip
+```
+
+**Response:**
+```
+[COMMAND] Sessions for this chat:
+1. s-3f2a1b9c8d7e (untitled) (12 msgs, 2026-11-14) — "halo, mau tanya soal..." [current]
+2. s-9c8d7e6f5a4b planning the trip (34 msgs, 2026-11-10) — "oke, jadi kita mau ke..."
+
+Resume with: !resume <number|name|id>
+```
+
+**Errors:**
+```
+[COMMAND] No sessions found.
+[COMMAND] No sessions match "xyz".
+```
+
+---
+
+### `!resume <n|name|id>`
+
+Resume a previous session for this chat. Accepts the list number from `!sessions`, a title (exact or partial), or a session ID (full or `s-` prefix).
+
+```
+!resume 2
+!resume trip
+!resume s-9c8d7e6f5a4b
+```
+
+**Response:**
+```
+[COMMAND] Resumed session: planning the trip (s-9c8d7e6f5a4b, 34 msgs)
+```
+
+**Errors:**
+```
+[COMMAND] Provide a session number, name, or ID. Use !sessions to see them.
+[COMMAND] No session matches "xyz".
+```
+
+> `!resume` with **no argument** resumes the bot (see below).
+
+---
+
+### `!delete <n|name|id>`
+
+Delete a session (same reference forms as `!resume`). If it's the current one, a fresh replacement session is started.
+
+```
+!delete 2
+```
+
+**Response:**
+```
+[COMMAND] Deleted session: planning the trip (s-9c8d7e6f5a4b)
+```
+
+**Errors:**
+```
+[COMMAND] Provide a session number, name, or ID. Use !sessions to see them.
+[COMMAND] No session matches "xyz".
 ```
 
 ---
 
 ### `!memory`
 
-Show session/memory statistics for the sender.
+Show session/memory stats for the sender's current session.
 
 ```
 !memory
@@ -154,12 +212,12 @@ Show session/memory statistics for the sender.
 
 **Response:**
 ```
-[COMMAND] Memory stats for 1234567890:
-- Total messages: 42
-- Current session: 15 min
-- Last message: 2 min ago
-- New session: no
-- Est. storage: 3 KB
+[COMMAND] Session stats for 1234567890:
+- Session: s-3f2a1b9c8d7e (12 msgs)
+- Started: 2026-11-14 08:00
+- Last activity: 2 min ago
+- Summary: 0 chars
+- Facts stored: 3
 ```
 
 ---
@@ -219,19 +277,18 @@ Show a full memory/stats overview.
 
 **Response:**
 ```
-[COMMAND] Stats for 1234567890:
-- Messages: 42
+[COMMAND] Stats:
+- Total sessions: 9 (2 named)
+- Total messages: 153
 - Facts stored: 3
-- Summary: 847 chars
-- Last message: 2 min ago
-- Est. storage: 3 KB
+- Current session: s-3f2a1b9c8d7e (12 msgs)
 ```
 
 ---
 
 ### `!reset`
 
-Clear all conversation history for the sender's number.
+Delete **all** sessions for this chat and start a fresh one.
 
 ```
 !reset
@@ -239,10 +296,10 @@ Clear all conversation history for the sender's number.
 
 **Response:**
 ```
-[COMMAND] Conversation history cleared!
+[COMMAND] All sessions for this chat deleted (3 sessions). Fresh start.
 ```
 
-> This deletes from the `messages` table only. Facts and summaries are preserved.
+> Facts are preserved (they are per-user, not per-session).
 
 ---
 
@@ -263,7 +320,7 @@ Pause the bot. Self-chat still works; other messages are skipped.
 
 ### `!resume`
 
-Resume the bot.
+Resume the bot (no argument). With an argument, resumes a session (see above).
 
 ```
 !resume
@@ -311,10 +368,9 @@ Toggle reply behavior at runtime.
 ✓ dm = on
 
 Bot reply settings:
-- group mention: off
+- group mention: off (ON = shared group session, speaks on @mention)
 - dm:            ON
 - self chat:     ON
-- group (always): OFF (hardcoded)
 
 Toggle: !replies <group_mention|dm|self_chat> <on|off>
 ```
@@ -350,10 +406,9 @@ Show current reply settings.
 **Response:**
 ```
 Bot reply settings:
-- group mention: off
+- group mention: off (ON = shared group session, speaks on @mention)
 - dm:            ON
 - self chat:     ON
-- group (always): OFF (hardcoded)
 
 Toggle: !replies <group_mention|dm|self_chat> <on|off>
 ```
@@ -383,7 +438,8 @@ Toggle: !replies <group_mention|dm|self_chat> <on|off>
 | `2` | Settings |
 | `3` | Connect / Disconnect session |
 | `4` | Start bot |
-| `5` | Quit |
+| `5` | Sessions (ledger overview) |
+| `6` | Quit |
 | `q` / `quit` / `exit` | Quit |
 | `Ctrl+C` | Return to menu (from live view) |
 
@@ -406,6 +462,10 @@ After selecting a provider, you're prompted for model details (varies by provide
 | `3` | Toggle self-chat |
 | `4` | Back to main menu |
 
+### Sessions view
+
+Read-only overview of the session ledger: totals (sessions, named, messages) plus the current session per chat (key, ID, title, message count, state, last activity). Press Enter to return to the menu.
+
 ### Live view (when bot is running)
 
 | Input | Action |
@@ -427,18 +487,20 @@ Commands are checked in this order inside `handle_commands()`:
 1. `!replies` / `!toggle` / `!status` — **no delay** (control commands)
 2. `!files` — 2-5s random delay
 3. `!removefile` — 2-5s random delay
-4. `!commands` / `!komennot` — 2-5s random delay
-5. `!prompts` — 2-5s random delay
-6. `!editprompt` — 2-5s random delay
-7. `!renamebot` — 2-5s random delay
-8. `!memory` — 2-5s random delay
-9. `!facts` — 2-5s random delay
-10. `!forget` — 2-5s random delay
-11. `!stats` — 2-5s random delay
-12. `!reset` — 2-5s random delay
-13. `!pause` — 2-5s random delay
-14. `!resume` — 2-5s random delay
-15. `!permanentstop` — 2-5s random delay
-16. Any other `!...` — 2-5s random delay + "Unknown command"
+4. `!commands` — 2-5s random delay
+5. `!renamebot` — 2-5s random delay
+6. `!new` — 2-5s random delay
+7. `!title` — 2-5s random delay
+8. `!sessions` — 2-5s random delay
+9. `!resume` — 2-5s random delay
+10. `!delete` — 2-5s random delay
+11. `!memory` — 2-5s random delay
+12. `!facts` — 2-5s random delay
+13. `!forget` — 2-5s random delay
+14. `!stats` — 2-5s random delay
+15. `!reset` — 2-5s random delay
+16. `!pause` — 2-5s random delay
+17. `!permanentstop` — 2-5s random delay
+18. Any other `!...` — 2-5s random delay + "Unknown command"
 
 > The random delay makes command responses feel less robotic. Reply-toggle commands (`!replies`, `!status`) skip the delay since they're control commands.

@@ -175,6 +175,6 @@ cython_debug/
 
 .env.*
 
-# Personalized prompts (your own persona/config) — keep private.
-# A public template lives in prompts_example.py.
-prompts.py
+# Your persona (your own character) — keep private.
+# A public template lives in SOUL.example.md.
+SOUL.md

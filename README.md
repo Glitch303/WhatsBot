@@ -1,6 +1,6 @@
 # WhatsBot — WhatsApp AI Chatbot
 
-A personal WhatsApp AI assistant that runs on a local LLM (or any OpenAI-compatible API). It answers DMs, self-chat messages, and optional group @mentions — all while keeping a rolling conversation memory, durable facts, and a watchdog filter that keeps it from answering the wrong things.
+A personal WhatsApp AI assistant that runs on a local LLM (or any OpenAI-compatible API). It answers DMs, self-chat messages, and group @mentions — keeping a per-chat session ledger (resumable), a rolling conversation summary, and durable facts about you. Its personality lives in a single `SOUL.md` file you edit directly.
 
 Built on top of [Neonize](https://github.com/krypton-byte/neonize) (a Python wrapper for [Whatsmeow](https://github.com/tulir/whatsmeow)) and the OpenAI Python SDK.
 
@@ -29,12 +29,14 @@ Built on top of [Neonize](https://github.com/krypton-byte/neonize) (a Python wra
 | Feature | Description |
 |---------|-------------|
 | **WhatsApp Integration** | Uses Neonize/Whatsmeow — no WhatsApp Business API needed. Log in with a QR code. |
+| **File-Based Persona** | The entire personality lives in `SOUL.md` (gitignored). Edit it, save, and the change applies on the very next message — no restart, no prompt juggling. |
+| **Session Management** | One session per chat (DM, self-chat, group). `!new` starts a fresh one, `!sessions` lists the ledger, `!resume` reopens any previous session, `!delete` removes one. |
+| **Shared Group Sessions** | With group mode ON, every group message is recorded as context in a shared session (speakers labeled `[Name]`), and the bot speaks only when @mentioned. |
 | **Multi-Provider LLM** | Works with OpenAI, Azure OpenAI, OpenRouter, or any local llama.cpp / llama-swap server. Switch providers at runtime from the menu. |
 | **Self-Chat Support** | The bot's own "Message yourself" chat works as a control channel — send commands and test responses without involving another person. |
-| **DM / Group / Self-Chat Toggles** | Reply behavior for each channel type can be turned on/off at runtime (self-chat defaults ON, DM defaults OFF, group @mention defaults OFF). |
+| **DM / Group / Self-Chat Toggles** | Reply behavior for each channel type can be turned on/off at runtime (self-chat defaults ON, DM defaults ON, group mode defaults OFF). |
 | **Reply Whitelist** | Restrict who gets AI responses to a comma-separated list of phone numbers. `*` = everyone. |
-| **Watchdog Filter** | A secondary LLM call screens each message for inappropriate, violent, or malicious content before the main response is generated. |
-| **Rolling Memory** | Conversation history is summarized into a compact rolling summary when it exceeds the verbatim window, so long conversations don't blow the context budget. |
+| **Rolling Memory** | Conversation history beyond the verbatim window is summarized into a compact rolling summary (per session), so long conversations stay coherent. |
 | **Fact Extraction** | Durable facts (names, preferences, plans, etc.) are extracted from messages and injected into future context. |
 | **File Ingestion** | Send PDF, DOCX, or TXT files from an admin number — content is extracted and used as context for all subsequent responses. |
 | **Session Awareness** | Detects when a user returns after a long gap and tells the LLM about it ("new session, last conversation was 3 hours ago"). |
@@ -55,20 +57,22 @@ Incoming WhatsApp message
   │  on_message │  (whatsapp.py)
   └──────┬──────┘
          │
-         ├─ Parse: chat JID, sender, text, from_me, is_group, is_edit, is_viewonce
+         ├─ Parse: chat JID, sender, text, is_group, is_edit, is_viewonce
          │
          ├─ Resolve LID → phone number (cached)
          │
          ├─ Classify: self-chat? group? DM?
          │     │
-         │     ├─ group:  reply only if @mentioned AND group_mention toggle ON
+         │     ├─ group (mode ON):
+         │     │     @mentioned → process
+         │     │     otherwise  → record as group context, no reply
+         │     ├─ group (mode OFF): skip
          │     ├─ self:   reply if self_chat toggle ON (default)
-         │     └─ DM:     reply if dm toggle ON
+         │     └─ DM:     reply if dm toggle ON (default)
          │
          ├─ Skip if older than 60s, or if bot is paused (except self-chat)
          │
          ├─ Mark as read
-         ├─ Save to SQLite (messages table)
          │
          ├─ Is it a command? ──► handle_commands() → return
          ├─ Is it a file?    ──► handle_file()     → return
@@ -76,33 +80,33 @@ Incoming WhatsApp message
          ├─ Whitelist check (phone number match)
          ├─ Rate limit check
          │
-         ├─ Session detection (new? first-ever? ongoing?)
+         ├─ Session: ensure active session for this chat, store the message
          ├─ Prune old messages if > 100 stored
-         ├─ Summarize older messages if > VERBATIM_TURNS
+         ├─ Summarize older messages if > VERBATIM_TURNS user turns
          ├─ Extract facts (background thread, non-blocking)
          │
-         ├─ First-ever message? ──► handle_greeting()
-         └─ Otherwise           ──► handle_final_response()
-                                       │
-                                       ├─ Watchdog LLM call (relevant?)
-                                       │     └─ not relevant → silent
-                                       │
-                                       └─ Generate final response
-                                             (budget-aware context:
-                                              facts + summary + tail)
+         └─ handle_final_response()
+               │
+               ├─ Build conversation:
+               │     SOUL.md + owner/group note + session note
+               │     + [FACTS] + [CONVERSATION SUMMARY] + [ADDITIONAL CONTENT]
+               │     + verbatim history tail + current turn
+               │
+               └─ LLM call → send reply → store assistant message
 ```
 
 ### Memory Model
 
-The bot maintains three layers of context for each user:
+Every LLM call is assembled from the persona plus three memory layers:
 
-| Layer | What | Lifetime | Budget |
-|-------|------|----------|--------|
-| **Facts** | Durable, verifiable statements (names, preferences, plans) | 60 days (pruned if unconfirmed) | 25% of context |
-| **Summary** | Rolling conversation summary (LLM-generated) | 30 days | 50% of remaining |
-| **Verbatim Tail** | Last N messages (exact text) | 30 days | Rest of budget |
+| Layer | What | Scope | Lifetime |
+|-------|------|-------|----------|
+| **SOUL.md** | The persona (public face, private face, how you talk) | global | re-read on every message |
+| **Facts** | Durable, verifiable statements (names, preferences, plans) | per user | 60 days (pruned if unconfirmed) |
+| **Summary** | Rolling conversation summary (LLM-generated) | per session | until the session ends |
+| **Verbatim Tail** | Last `VERBATIM_TURNS` user turns + replies (exact text) | per session | 30 days |
 
-The total context is capped at `CONTEXT_CHAR_BUDGET` (default 2000 chars ≈ 500 tokens).
+There is no character budget — the context is the persona + memory blocks + a fixed-size verbatim tail. Older messages are folded into the rolling summary instead of being dropped.
 
 ---
 
@@ -130,19 +134,19 @@ pip install -r requirements.txt
 
 # 4. Configure
 cp example.env .env
-# Edit .env — set ASSISTANT_NAME, ADMIN_NUMBERS, and your LLM provider
+# Edit .env — set ADMIN_NUMBERS, OWNER_NAME, and your LLM provider
 
-# 5. Copy the example prompt file (prompts.py is gitignored — create your own)
-cp prompts_example.py prompts.py
-# Edit prompts.py — customize the assistant persona, name, speech style, etc.
+# 5. Create your persona file (SOUL.md is gitignored — create your own)
+cp SOUL.example.md SOUL.md
+# Edit SOUL.md — customize the character, owner, speech style, etc.
 
 # 6. Start
 python main.py
 ```
 
-> **Note:** `prompts.py` is intentionally **gitignored** so your personal persona and
-> configuration stay private. The public template is `prompts_example.py` — copy it to
-> `prompts.py` on first run (step 5 above) and edit from there.
+> **Note:** `SOUL.md` is intentionally **gitignored** so your personal persona stays
+> private. The public template is `SOUL.example.md` — copy it to `SOUL.md` on first
+> run (step 5 above) and edit from there. Edits apply on the next message.
 
 The first time you run it, the menu will show a QR code. Scan it with WhatsApp → **Settings → Linked Devices → Link a Device**.
 
@@ -171,18 +175,17 @@ All configuration lives in `.env`. See [docs/CONFIGURATION.md](docs/CONFIGURATIO
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ASSISTANT_NAME` | — | The bot's persona name (injected into prompts) |
 | `ADMIN_NUMBERS` | — | Comma-separated phone numbers allowed to send commands |
+| `OWNER_NAME` | `Owner` | The owner's name (used for the public/private face) |
+| `OWNER_NUMBER` | — (name match) | Owner's phone number (exact match; falls back to pushname) |
 | `REPLY_WHITELIST` | `*` | Phone numbers that get AI responses (`*` = everyone) |
 | `LLM_PROVIDER` | — | `openai` \| `azure` \| `openrouter` \| `llamacpp` |
-| `SESSION_GAP_SECONDS` | `3600` | Silence gap (seconds) before a new session starts |
-| `VERBATIM_TURNS` | `10` | How many recent messages kept verbatim in context |
-| `CONTEXT_CHAR_BUDGET` | `2000` | Max chars for assembled context (~500 tokens) |
+| `SESSION_GAP_SECONDS` | `3600` | Silence gap (seconds) before a session is reported as "new" |
+| `VERBATIM_TURNS` | `10` | How many recent user turns kept verbatim in context |
 | `MEMORY_CUTOFF_DAYS` | `30` | Prune messages older than this |
 | `FACT_CUTOFF_DAYS` | `60` | Prune facts unconfirmed for longer than this |
 | `MAX_FACTS_IN_CONTEXT` | `8` | Max facts injected into the context window |
 | `MAX_REPLY_TOKENS` | `500` | Hard token cap per LLM reply |
-| `MAX_REPLY_WORDS` | `120` | Soft word cap (prompt instruction) |
 
 ### LLM Provider Options
 
@@ -204,16 +207,19 @@ Send these from your admin number (configured in `ADMIN_NUMBERS`):
 | `!commands` | List all available commands |
 | `!files` | List uploaded files |
 | `!removefile <ID or name>` | Remove a file |
-| `!prompts` | Show current editable prompts |
-| `!editprompt <name> <content>` | Edit a public prompt |
 | `!renamebot <name>` | Change the bot's name |
+| `!new` | Start a new session (previous one stays saved, resumable) |
+| `!title [name]` | Set/show the title of the current session |
+| `!sessions [search]` | List sessions for this chat (optionally search) |
+| `!resume <n\|name\|id>` | Resume a previous session (bare `!resume` resumes the bot) |
+| `!delete <n\|name\|id>` | Delete a session |
 | `!memory` | Show your session/memory stats |
 | `!facts` | List stored facts about you |
 | `!forget <ID>` | Delete a specific fact by ID |
 | `!stats` | Show full memory/stats overview |
-| `!reset` | Clear conversation history for your number |
+| `!reset` | Delete all sessions for this chat (fresh start) |
 | `!pause` | Pause the bot (self-chat still works) |
-| `!resume` | Resume the bot |
+| `!resume` | Resume the bot (no argument) |
 | `!permanentstop` | Stop the bot permanently |
 | `!replies <key> <on\|off>` | Toggle reply behavior: `!replies dm on`, `!replies self_chat off`, etc. |
 | `!status` | Show current reply settings |
@@ -241,7 +247,8 @@ Running `python main.py` opens a terminal menu:
     [2] Settings
     [3] Disconnect session (stop bot)
     [4] Start bot (connected)
-    [5] Quit
+    [5] Sessions
+    [6] Quit
 ```
 
 ### Menu Items
@@ -249,10 +256,11 @@ Running `python main.py` opens a terminal menu:
 | # | Action | Description |
 |---|--------|-------------|
 | 1 | **Select model** | Switch LLM provider and model at runtime. For `llamacpp`, fetches the model list from the server. |
-| 2 | **Settings** | Toggle DM / group @mention / self-chat replies. View context/memory settings. |
+| 2 | **Settings** | Toggle DM / group mode / self-chat replies. View session/memory settings. |
 | 3 | **Connect / Disconnect** | Connect = QR-scan to log in (session shows "CONNECTED"). Disconnect = stop bot + drop session. |
 | 4 | **Start bot** | Activate the bot and enter the live log view. Session stays connected. |
-| 5 | **Quit** | Exit the program. |
+| 5 | **Sessions** | Read-only ledger overview: totals + the current session per chat. |
+| 6 | **Quit** | Exit the program. |
 
 ### Live View Commands
 
@@ -272,7 +280,7 @@ When the bot is running (option 4), the terminal shows live logs. Type:
 | State | Session | Bot | Self-chat | DMs | Groups |
 |-------|---------|-----|-----------|-----|--------|
 | **Standby** (after Connect) | ✅ Connected | ⏸ Paused | ✅ Works | ❌ Skipped | ❌ Skipped |
-| **Running** (after Start) | ✅ Connected | ▶️ Active | ✅ Works | ✅ (if toggle ON) | ✅ (if @mentioned + toggle ON) |
+| **Running** (after Start) | ✅ Connected | ▶️ Active | ✅ Works | ✅ (if toggle ON) | ✅ (if mode ON; context always recorded) |
 | **Disconnected** | ❌ | ⏸ | ❌ | ❌ | ❌ |
 
 ---
@@ -283,19 +291,21 @@ When the bot is running (option 4), the terminal shows live logs. Type:
 WhatsBot/
 ├── main.py              # Entry point: logging, Neonize client, menu loop
 ├── menu.py              # Terminal UI: standby menu, live log view, model picker
-├── config.py            # All config from .env (loaded once at startup)
+├── config.py            # All config from .env + SOUL.md loader
 ├── whatsapp.py          # Message handler: on_message, commands, files, LID resolution
 ├── bot_settings.py      # Thread-safe runtime settings (dm, group_mention, self_chat)
-├── database.py          # SQLite: messages, summaries, facts tables + helpers
-├── llm.py              # LLM provider client, watchdog, summary, fact extraction, context builder
-├── prompts_example.py   # Public template — copy to prompts.py and customize
-├── prompts.py           # Your personal prompts (gitignored — create from example)
+├── sessionstore.py      # Session store: sessions, messages, summaries (persistent SQLite)
+├── database.py          # SQLite: facts table (per-user durable facts)
+├── llm.py               # LLM client, conversation assembly, summary, fact extraction
+├── prompts.py           # Prompt scaffolding (group note, summary, fact prompts)
+├── SOUL.md              # Your persona (gitignored — create from SOUL.example.md)
+├── SOUL.example.md      # Public template for SOUL.md
 ├── requirements.txt     # Dependencies
 ├── .env                 # Environment config (gitignored)
 ├── example.env          # Template for .env
 ├── app.log              # Log file (all DEBUG level)
 ├── db/
-│   ├── conversations.sqlite3   # Bot conversation memory
+│   ├── conversations.sqlite3   # Sessions, messages, summaries, facts
 │   └── neonize.sqlite3         # Neonize/Whatsmeow session state
 ├── messages/            # Raw received media (from history sync)
 ├── downloads/           # Admin-uploaded original files
@@ -331,19 +341,19 @@ For deeper technical detail, see:
 - Check the log for `Resolved LID ... -> ...` to see what phone number was resolved.
 
 ### Bot not responding to DMs
-- Check `!status` — is the `dm` toggle ON? (Defaults OFF.)
+- Check `!status` — is the `dm` toggle ON? (Defaults ON.)
 - Check `REPLY_WHITELIST` in `.env` — is the number included?
 - Check the log for "Skipping DM from ..." or "not in reply whitelist".
 
 ### Bot responding in the wrong language
-- The private prompts enforce "respond in the same language as the user's message." If it's mixing languages, the model may be too small. Try a larger model.
+- The language rule lives in `SOUL.md` ("respond in the same language as the user's message"). If it's mixing languages, the model may be too small — try a larger model, or strengthen the rule in `SOUL.md`.
 
 ### LLM errors
 - Check `app.log` for "Error calling LLM API". Common causes: model not loaded, server unreachable, API key invalid.
 - For `llamacpp`, verify the server is running: `curl http://localhost:8080/v1/models`.
 
 ### Messages from history sync
-- On first connect, Whatsmeow syncs conversation history. These are saved to the DB but **not** processed for replies (only real-time messages are).
+- On first connect, Whatsmeow syncs conversation history. These are backfilled into sessions but **not** processed for replies (only real-time messages are).
 
 ---
 

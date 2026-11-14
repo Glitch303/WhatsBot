@@ -1,39 +1,36 @@
+"""LLM layer: client, system-prompt assembly, conversation building,
+summarization, fact extraction.
+
+Single pipeline (DiscordBot model): one system prompt (SOUL.md + owner/group
+note + memory context) + session history + the current user turn.
+"""
+
 import json
 import os
-from typing import Optional, Tuple
+import re
 
 from neonize.utils import log
 from openai import AzureOpenAI, OpenAI
-from pydantic import BaseModel
 
 from config import (
-    AI_ASSISTANT_NAME,
     AZURE_API_VERSION,
     AZURE_DEPLOYMENT_NAME,
     AZURE_ENDPOINT,
     AZURE_SUBSCRIPTION_KEY,
-    CONTEXT_CHAR_BUDGET,
     LLM_PROVIDER,
+    LLAMACPP_API_KEY,
     LLAMACPP_BASE_URL,
     LLAMACPP_MODEL,
     MAX_FACTS_IN_CONTEXT,
     MAX_REPLY_TOKENS,
-    MAX_REPLY_WORDS,
-    SESSION_GAP_SECONDS,
+    OWNER_NAME,
+    OWNER_NUMBER,
     VERBATIM_TURNS,
+    load_soul,
+    norm_phone,
 )
-from database import (
-    get_recent_messages_formatted,
-    get_verbatim_tail,
-    get_messages_since,
-    get_summary,
-    save_summary,
-    save_fact,
-    get_facts,
-    is_new_session,
-    get_session_stats,
-)
-from prompts import SUMMARY_SYSTEM_PROMPT, FACT_EXTRACTION_PROMPT
+from database import save_fact, get_facts
+from prompts import GROUP_CHAT_NOTE, SUMMARY_SYSTEM_PROMPT, FACT_EXTRACTION_PROMPT
 
 
 def get_client_and_model():
@@ -81,20 +78,18 @@ def get_client_and_model():
     elif provider == "llamacpp":
         base_url = override_base_url or LLAMACPP_BASE_URL
         model = override_model or LLAMACPP_MODEL
-        return OpenAI(base_url=base_url, api_key="llamacpp"), model
+        api_key = LLAMACPP_API_KEY or "llamacpp"  # "llamacpp" = no-auth servers
+        return OpenAI(base_url=base_url, api_key=api_key), model
     else:
         raise ValueError(f"Unsupported LLM provider: {provider!r}. Expected one of: openai, azure, openrouter, llamacpp")
 
 
-def call_llm_api(system_prompt: str, user_prompt: str) -> str:
+def call_llm_api(messages: list) -> str:
     """
-    Unified function to call the LLM API using the OpenAI Python SDK.
+    Unified function to call the LLM API with a full message list
+    (system prompt + history + current user turn).
     Returns the response text, or "" on error.
     """
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
     try:
         client, model = get_client_and_model()
         response = client.chat.completions.create(
@@ -108,77 +103,124 @@ def call_llm_api(system_prompt: str, user_prompt: str) -> str:
         return ""
 
 
-def _call_llm_structured(system_prompt: str, user_prompt: str, max_tokens: int = 200) -> dict:
+# ---- owner identity -----------------------------------------------------------
+
+
+def is_owner(sender_phone: str, sender_name: str) -> bool:
+    """True if the sender is the owner.
+
+    Exact phone match when OWNER_NUMBER is set; otherwise pushname match.
     """
-    Calls the LLM and parses the JSON response.
-    Uses response_format=json_object when supported, falls back to manual JSON parsing.
-    Returns the parsed dict, or {} on error.
+    if OWNER_NUMBER and sender_phone:
+        return norm_phone(sender_phone) == norm_phone(OWNER_NUMBER)
+    if sender_name and sender_name.strip().lower() == OWNER_NAME.strip().lower():
+        return True
+    return False
+
+
+def _owner_tag() -> str:
+    if OWNER_NUMBER:
+        return f"{OWNER_NAME} (phone {OWNER_NUMBER})"
+    return OWNER_NAME
+
+
+# ---- system prompt / conversation assembly -------------------------------------
+
+
+def build_system_prompt(is_group: bool, is_owner: bool, session_note: str = "",
+                        facts_text: str = "", summary_text: str = "",
+                        files_text: str = "") -> str:
+    """Assemble the system prompt: SOUL.md + owner/group note + memory context.
+
+    Mirrors DiscordBot: the persona (SOUL.md) is the base; the code states who
+    the owner is and whether the current sender is them (DMs), or adds the
+    stable group-chat section (shared group sessions).
     """
-    try:
-        client, model = get_client_and_model()
+    soul = load_soul()
+    if is_group:
+        system = soul + "\n" + GROUP_CHAT_NOTE.strip()
+        system += (
+            f"\n\n## Owner\nYour owner is {_owner_tag()}. In a group you only speak "
+            f"when @mentioned; the note attached to each turn says whether the "
+            f"person who mentioned you is your owner. How you treat each person "
+            f"is defined in your persona."
+        )
+    elif is_owner:
+        system = (
+            soul
+            + f"\n\nThe person messaging you right now is your owner: {_owner_tag()}. "
+            + "Use your private face."
+        )
+    else:
+        system = (
+            soul
+            + f"\n\nYour owner is {_owner_tag()}. "
+            + "The person messaging you right now is not them. Use your public face."
+        )
 
-        # Try structured output first (OpenAI beta, Azure, OpenRouter)
-        try:
-            response = client.beta.chat.completions.parse(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=max_tokens,
-                response_format=WatchdogResponse,
-            )
-            parsed = response.choices[0].message.parsed
-            return {"relevant": parsed.relevant, "response": parsed.response or ""}
-        except Exception:
-            # Fallback: plain call with json_object format
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=max_tokens,
-                response_format={"type": "json_object"},
-            )
-            content = response.choices[0].message.content or "{}"
-            return json.loads(content)
-
-    except json.JSONDecodeError as e:
-        log.error(f"Failed to parse LLM JSON response: {e}")
-        return {}
-    except Exception as e:
-        log.error(f"Error calling structured LLM: {e}")
-        return {}
+    extras = []
+    if session_note:
+        extras.append(session_note)
+    if facts_text:
+        extras.append(facts_text)
+    if summary_text:
+        extras.append(f"[CONVERSATION SUMMARY]\n{summary_text}")
+    if files_text:
+        extras.append(f"[ADDITIONAL CONTENT]\n{files_text}")
+    if extras:
+        system += "\n\n" + "\n\n".join(extras)
+    return system
 
 
-def call_watchdog_llm(user_message: str, watchdog_prompt: str) -> Tuple[bool, Optional[str]]:
-    """
-    Calls the watchdog LLM and returns (is_relevant, response_text).
-    Returns (False, None) on error.
-    """
-    log.info(f"Calling watchdog LLM with user message: {user_message}")
-    additional_content = _read_converted_files()
+def _facts_text(user_id: str) -> str:
+    """Durable facts about this user, formatted for the system prompt."""
+    facts = get_facts(user_id, MAX_FACTS_IN_CONTEXT)
+    if not facts:
+        return ""
+    lines = [f"- {fact}" for (_, fact, _, _, _, _) in facts]
+    return "[FACTS about this user]\n" + "\n".join(lines)
 
-    system_prompt = watchdog_prompt.format(
-        user_message=user_message,
-        additional_content=additional_content or "No additional info from files.",
+
+def build_convo(store, session_id: str, user_text: str, user_name: str,
+                is_group: bool, is_owner: bool, user_id: str,
+                session_note: str = "") -> list:
+    """Assemble the full conversation: system prompt + session history + the
+    current user turn (DiscordBot's single-pipeline model)."""
+    summary_text, _ = store.get_summary(session_id)
+    system = build_system_prompt(
+        is_group=is_group,
+        is_owner=is_owner,
+        session_note=session_note,
+        facts_text=_facts_text(user_id),
+        summary_text=summary_text or "",
+        files_text=_read_converted_files(),
     )
+    history = store.history(session_id, VERBATIM_TURNS, label_senders=is_group)
 
-    result = _call_llm_structured(system_prompt, user_message)
+    user_content = user_text
+    if is_group:
+        user_content = f"[{user_name}] {user_text}"
+        if is_owner:
+            user_content += "\n(You are replying to your owner. Private face.)"
+        else:
+            user_content += "\n(You are replying to someone who is not your owner. Public face.)"
 
-    if not result:
-        log.warning("Watchdog LLM returned no valid response; defaulting to relevant.")
-        return True, None
-
-    is_relevant = result.get("relevant", True)
-    response_text = result.get("response", "")
-    return is_relevant, response_text or None
+    convo = [{"role": "system", "content": system}]
+    convo.extend(history)
+    convo.append({"role": "user", "content": user_content})
+    return convo
 
 
-class WatchdogResponse(BaseModel):
-    relevant: bool
-    response: Optional[str] = None
+def generate_final_response(store, session_id: str, user_id: str, user_text: str,
+                            user_name: str, is_group: bool, is_owner: bool,
+                            session_note: str = "") -> str:
+    """Generate the reply for the current turn."""
+    convo = build_convo(store, session_id, user_text, user_name,
+                        is_group, is_owner, user_id, session_note)
+    return call_llm_api(convo)
+
+
+# ---- files ----------------------------------------------------------------------
 
 
 def _read_converted_files() -> str:
@@ -195,241 +237,97 @@ def _read_converted_files() -> str:
     return additional_content
 
 
-def summarize_session(user_id: str) -> bool:
+# ---- rolling summary (per session) -------------------------------------------------
+
+
+def summarize_session(store, session_id: str, user_id: str) -> bool:
     """
-    Summarize messages that fall outside the verbatim tail window.
-    Merges with the existing summary (if any) and stores the result.
-    Returns True if a summary was generated and saved, False otherwise.
+    Summarize messages that fall outside the verbatim tail window of this
+    session. Merges with the existing summary and stores the result.
     """
-    import time
-    tail = get_verbatim_tail(user_id, VERBATIM_TURNS)
-    if not tail:
+    tail_ts = store.oldest_tail_timestamp(session_id, VERBATIM_TURNS)
+    if tail_ts is None:
         return False
 
-    oldest_tail_ts = tail[0][1]  # timestamp of the oldest message in the verbatim tail
-    existing_summary, last_summarized_ts = get_summary(user_id)
-
-    # Only summarize if there are messages older than the tail window
-    # and they haven't been summarized yet.
+    existing_summary, last_summarized_ts = store.get_summary(session_id)
     effective_since = last_summarized_ts if last_summarized_ts else 0
-    messages_to_summarize = get_messages_since(user_id, effective_since)
-
-    # Exclude messages that are already in the verbatim tail
-    tail_timestamps = {ts for _, ts, _ in tail}
-    messages_to_summarize = [m for m in messages_to_summarize if m[1] not in tail_timestamps]
-
+    messages_to_summarize = [
+        m for m in store.messages_since(session_id, effective_since)
+        if m[1] < tail_ts
+    ]
     if not messages_to_summarize:
         return False
 
-    # Build the new messages text
-    new_lines = []
-    for content, ts, from_me in messages_to_summarize:
-        speaker = "ASSISTANT" if from_me else "USER"
-        new_lines.append(f"{speaker}: {content}")
-    new_messages_text = "\n".join(new_lines)
-
-    existing_summary_text = existing_summary or "(none)"
-
+    new_lines = [
+        f"{'ASSISTANT' if role == 'assistant' else 'USER'}: {content}"
+        for content, _ts, role in messages_to_summarize
+    ]
     system_prompt = SUMMARY_SYSTEM_PROMPT.format(
-        existing_summary=existing_summary_text,
-        new_messages=new_messages_text,
+        existing_summary=existing_summary or "(none)",
+        new_messages="\n".join(new_lines),
     )
-
-    log.info(f"Summarizing {len(messages_to_summarize)} older messages for user {user_id}")
-    result = call_llm_api(system_prompt, "Update the summary.")
-
+    result = call_llm_api([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "Update the summary."},
+    ])
     if not result or not result.strip():
-        log.warning(f"Summary generation failed for user {user_id}.")
         return False
 
-    result = result.strip()
-    # Cap the summary length to prevent unbounded growth
-    max_summary_chars = 1200  # ~300 words
-    if len(result) > max_summary_chars:
-        result = result[:max_summary_chars]
-
-    # Use the timestamp of the last message we just summarized
+    result = result.strip()[:1200]
     last_summarized = max(m[1] for m in messages_to_summarize)
-    save_summary(user_id, result, last_summarized)
-    log.info(f"Saved summary for user {user_id} ({len(result)} chars, up to ts={last_summarized}).")
+    store.save_summary(session_id, result, last_summarized)
+    log.info(f"Updated summary for session {session_id} ({len(new_lines)} messages).")
     return True
 
 
+# ---- fact extraction -----------------------------------------------------------------
+
+
 def normalize_entity(entity: str) -> str:
-    """
-    Normalize an entity name for consistent matching.
-    Lowercase, strip punctuation, collapse whitespace.
-    'John Smith' -> 'john smith', 'Dr. Jane Doe' -> 'jane doe'
-    """
-    import re
+    """Normalize an entity string: lowercase, no punctuation, single spaces."""
+    if not entity:
+        return "unknown"
     entity = entity.strip().lower()
-    entity = re.sub(r"[^\w\s]", "", entity)  # remove punctuation
-    entity = re.sub(r"\s+", " ", entity).strip()
+    entity = re.sub(r"[^\w\s]", "", entity)
+    entity = re.sub(r"\s+", " ", entity)
     return entity or "unknown"
 
 
 def extract_facts(user_id: str, user_message: str) -> int:
-    """
-    Extract durable facts from a user message and save them to the DB.
-    Returns the number of facts saved (0 if none or on error).
-    """
-    if not user_message or not user_message.strip():
-        return 0
-
+    """Extract durable facts from a user message. Returns number saved."""
     system_prompt = FACT_EXTRACTION_PROMPT.format(user_message=user_message)
-    result = call_llm_api(system_prompt, "Extract facts from the message above.")
-
-    if not result or not result.strip():
+    result = call_llm_api([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "Extract facts from the message above."},
+    ])
+    if not result:
         return 0
 
-    # Parse the JSON array
+    # Strip markdown code fences if present
+    result = result.strip()
+    if result.startswith("```"):
+        result = re.sub(r"^```(?:json)?\s*", "", result)
+        result = re.sub(r"\s*```$", "", result)
     try:
-        # Handle cases where the model wraps in code fences
-        result = result.strip()
-        if result.startswith("```"):
-            result = result.split("\n", 1)[1].rsplit("```", 1)[0].strip()
         facts = json.loads(result)
-        if not isinstance(facts, list):
-            return 0
-    except (json.JSONDecodeError, IndexError) as e:
-        log.warning(f"Failed to parse fact extraction response: {e}")
+    except json.JSONDecodeError as e:
+        log.error(f"Failed to parse fact extraction JSON: {e}")
+        return 0
+    if not isinstance(facts, list):
         return 0
 
     saved = 0
-    for item in facts[:5]:  # cap at 5 facts per message
+    for item in facts[:5]:
         if not isinstance(item, dict):
             continue
-        fact_text = str(item.get("fact", "")).strip()
-        entity_raw = str(item.get("entity", "unknown")).strip()
-        confidence = float(item.get("confidence", 0.5))
-        confidence = max(0.0, min(1.0, confidence))  # clamp to [0, 1]
-
-        if not fact_text:
+        fact = (item.get("fact") or "").strip()
+        if not fact:
             continue
-
-        entity = normalize_entity(entity_raw)
-        save_fact(user_id, fact_text, entity, confidence)
+        entity = normalize_entity(item.get("entity"))
+        try:
+            confidence = float(item.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        save_fact(user_id, fact, entity, confidence)
         saved += 1
-        log.info(f"Extracted fact for {user_id}: [{entity}] {fact_text} (conf={confidence:.1f})")
-
     return saved
-
-
-def generate_first_time_greeting(user_name: str, user_message: str, public_prompt: str, private_prompt: str) -> str:
-    """
-    Generates a first-time greeting by combining public and private prompts.
-    """
-    log.info(f"Generating first time greeting for user: {user_name}")
-    system_prompt = (public_prompt + "\n" + private_prompt).format(ai_assistant_name=AI_ASSISTANT_NAME)
-    raw_response = call_llm_api(system_prompt, user_message)
-    final_response = raw_response.replace("USER_NAME_HERE", user_name)
-    return final_response
-
-
-def build_context(user_id: str, current_message: str, char_budget: int = None) -> str:
-    """
-    Build a budget-aware context string from:
-      1. Stored facts (most recent first)
-      2. Rolling conversation summary
-      3. Verbatim message tail
-    Returns a formatted conversation block that fits within char_budget.
-    If there's no context at all, returns "".
-    """
-    if char_budget is None:
-        char_budget = CONTEXT_CHAR_BUDGET
-
-    tail = get_verbatim_tail(user_id, VERBATIM_TURNS)
-    if not tail:
-        return ""
-
-    # --- Facts section ---
-    facts = get_facts(user_id, MAX_FACTS_IN_CONTEXT)
-
-    # --- Summary section ---
-    summary_text, _ = get_summary(user_id)
-
-    # Format tail as conversation lines (newest last)
-    lines = []
-    for content, ts, from_me in tail:
-        speaker = "ASSISTANT" if from_me else "USER"
-        lines.append(f"{speaker}: {content}")
-
-    # Reserve space for the current message + separators.
-    reserved = len(current_message) + 60  # separators, labels
-    available = char_budget - reserved
-
-    # Facts get 25% of the budget (highest priority -- durable knowledge)
-    facts_text = ""
-    facts_reserved = 0
-    if facts:
-        facts_lines = []
-        for fid, fact, entity, conf, created, confirmed in facts:
-            facts_lines.append(f"- {fact}")
-        facts_text = "[FACTS]\n" + "\n".join(facts_lines)
-        max_facts = available // 4  # 25% cap
-        if len(facts_text) > max_facts:
-            facts_text = facts_text[:max_facts]
-        facts_reserved = len(facts_text) + 2
-
-    # Summary gets 50% of remaining space
-    summary_reserved = 0
-    max_summary = 0
-    if summary_text:
-        summary_label = "[CONVERSATION SUMMARY]\n"
-        max_summary = min(len(summary_text), (available - facts_reserved) // 2)
-        summary_reserved = len(summary_label) + max_summary + 2
-
-    tail_available = available - facts_reserved - summary_reserved
-
-    # Walk from newest to oldest, accumulating until we hit the budget
-    kept = []
-    used = 0
-    for line in reversed(lines):
-        line_cost = len(line) + 2  # + newline
-        if used + line_cost > tail_available and kept:
-            break
-        kept.insert(0, line)
-        used += line_cost
-
-    parts = []
-    if facts_text:
-        parts.append(facts_text)
-    if summary_text:
-        truncated = summary_text[:max_summary]
-        parts.append(f"[CONVERSATION SUMMARY]\n{truncated}")
-    if kept:
-        parts.append("\n".join(kept))
-
-    return "\n".join(parts)
-
-
-def generate_final_response(user_id: str, user_text: str, public_prompt: str, private_prompt: str, user_name: str = "User") -> str:
-    """
-    Generates the final response combining public and private prompts,
-    session context, and converted file content.
-    """
-    # Session detection
-    is_new, is_first = is_new_session(user_id)
-    stats = get_session_stats(user_id)
-
-    # Build budget-aware context
-    context = build_context(user_id, user_text)
-    additional_content = _read_converted_files()
-
-    # Session metadata for the prompt
-    if is_first:
-        session_info = "This is the user's first message ever."
-    elif is_new:
-        gap_hours = stats["session_gap_seconds"] / 3600 if stats["session_gap_seconds"] else 0
-        session_info = f"New session. Last conversation ended {gap_hours:.1f} hours ago."
-    else:
-        session_info = f"Ongoing session ({stats['session_age_seconds'] // 60} min active, {stats['message_count']} total messages)."
-
-    system_prompt = (public_prompt + "\n" + private_prompt).format(
-        ai_assistant_name=AI_ASSISTANT_NAME,
-        previous_messages=context or "(no previous messages)",
-        additional_content=additional_content or "No additional info from files.",
-        max_reply_words=MAX_REPLY_WORDS,
-        session_info=session_info,
-    ).replace("USER_NAME_HERE", user_name)
-    return call_llm_api(system_prompt, user_text)

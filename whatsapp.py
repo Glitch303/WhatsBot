@@ -13,29 +13,16 @@ from neonize.utils import log
 from neonize.utils.enum import ChatPresence, ChatPresenceMedia, ReceiptType
 from neonize.utils.jid import Jid2String
 
-from config import ADMIN_NUMBERS, REPLY_WHITELIST, SESSION_GAP_SECONDS, VERBATIM_TURNS
+from config import ADMIN_NUMBERS, REPLY_WHITELIST, SESSION_GAP_SECONDS, VERBATIM_TURNS, norm_phone
 from bot_settings import get_settings, toggle as toggle_setting, status_text
-from database import (
-    delete_messages,
-    get_messages,
-    get_session_stats,
-    is_new_session,
-    prune_old_messages,
-    prune_stale_facts,
-    save_message,
-    get_facts,
-    delete_fact,
-    get_fact_count,
-    get_summary,
+from database import get_facts, delete_fact, get_fact_count, prune_stale_facts
+from llm import (
+    extract_facts,
+    generate_final_response,
+    is_owner as is_owner_sender,
+    summarize_session,
 )
-from llm import generate_final_response, generate_first_time_greeting, summarize_session, extract_facts
-from prompts import (
-    PRIVATE_FINAL_RESPONSE_PROMPT,
-    PRIVATE_GREETING_PROMPT,
-    PRIVATE_WATCHDOG_PROMPT,
-    PUBLIC_FINAL_RESPONSE_PROMPT,
-    PUBLIC_GREETING_PROMPT,
-)
+from sessionstore import store
 
 
 def sanitize_filename(filename: str) -> str:
@@ -49,7 +36,9 @@ def sanitize_filename(filename: str) -> str:
         filename = "_" + filename
     return filename or "file"
 
+
 is_bot_running = True
+
 
 def set_bot_running(value: bool):
     """Toggle the bot's running state (used by terminal commands)."""
@@ -57,20 +46,10 @@ def set_bot_running(value: bool):
     is_bot_running = bool(value)
     log.info(f"Bot running state set to: {is_bot_running}")
 
-# Public prompts (admin can edit, reset on startup)
-public_prompts = {
-    "greeting": PUBLIC_GREETING_PROMPT,
-    "final_response": PUBLIC_FINAL_RESPONSE_PROMPT
-}
-# Yksityiset promptit (ei muokattavissa)
-private_prompts = {
-    "greeting": PRIVATE_GREETING_PROMPT,
-    "final_response": PRIVATE_FINAL_RESPONSE_PROMPT,
-    "watchdog": PRIVATE_WATCHDOG_PROMPT
-}
 
 # --- Self-chat / identity helpers ---
 _self_chat_jid = None  # set on first connection (normalized via Jid2String)
+
 
 def set_self_chat_jid(jid):
     """Record the bot's own chat JID (e.g. '6285712345678@s.whatsapp.net')."""
@@ -78,8 +57,10 @@ def set_self_chat_jid(jid):
     _self_chat_jid = Jid2String(jid)
     log.info(f"Self-chat JID set: {_self_chat_jid}")
 
+
 def get_self_chat_jid():
     return _self_chat_jid
+
 
 def is_self_chat(chat_jid, sender_id):
     """True if this is a message in the bot's own self-chat.
@@ -94,6 +75,7 @@ def is_self_chat(chat_jid, sender_id):
         return False
     return chat_str == _self_chat_jid
 
+
 def get_bot_jid(client):
     """Return the bot's own JID (as a JID object) if available."""
     try:
@@ -104,11 +86,13 @@ def get_bot_jid(client):
         log.debug(f"get_me() failed: {e}")
     return None
 
+
 # --- LID -> phone-number resolution (cached) ---
 # In groups, whatsmeow reports the sender as a LID (Server == "lid") instead of a
 # phone number, which breaks phone-based whitelists. We resolve LID -> phone once
 # and cache it so repeat messages don't re-query the store.
 _lid_cache = {}  # lid_str -> phone_str
+
 
 def resolve_sender_phone(client, sender_jid) -> str:
     """
@@ -139,6 +123,7 @@ def resolve_sender_phone(client, sender_jid) -> str:
     _lid_cache[s] = phone
     return phone
 
+
 def is_bot_mentioned(message, bot_jid):
     """Check if the bot is @mentioned in this message (group contextInfo)."""
     if not bot_jid:
@@ -157,6 +142,38 @@ def is_bot_mentioned(message, bot_jid):
     except Exception as e:
         log.debug(f"mention check failed: {e}")
     return False
+
+
+# --- Session keys ------------------------------------------------------------------
+
+
+def session_key_for(is_group: bool, is_self: bool, chat_jid, sender_id: str) -> str:
+    """Stable key per conversation: one shared session per group, one per DM,
+    one for the self-chat."""
+    if is_self:
+        return "self"
+    if is_group:
+        return f"ch-{Jid2String(chat_jid) if hasattr(chat_jid, 'User') else chat_jid}"
+    return f"dm-{sender_id}"
+
+
+def _session_note(session: dict) -> str:
+    """Small session context line for the system prompt (first-ever / gap)."""
+    if not session or session["message_count"] == 0:
+        return "This is the user's first message ever."
+    last = session["last_activity_at"]
+    if last and (time.time() - last) > SESSION_GAP_SECONDS:
+        hours = (time.time() - last) / 3600
+        return f"New session. Last conversation ended {hours:.1f} hours ago."
+    return ""
+
+
+def _whitelisted(phone: str) -> bool:
+    """True if the phone number is in the reply whitelist (or the whitelist is open)."""
+    if not REPLY_WHITELIST or "*" in REPLY_WHITELIST:
+        return True
+    return norm_phone(phone) in {norm_phone(num) for num in REPLY_WHITELIST}
+
 
 # --- Command: reply toggles + status (self-chat / admin) ---
 def handle_reply_commands(client, chat, sender_id, text):
@@ -204,6 +221,7 @@ def handle_reply_commands(client, chat, sender_id, text):
 
     return False
 
+
 # --- Helper functions ---
 def convert_pdf_to_markdown(pdf_path):
     """Converts a PDF file to markdown text."""
@@ -221,6 +239,7 @@ def convert_pdf_to_markdown(pdf_path):
     except Exception as e:
         return f"Error reading PDF: {e}"
 
+
 def convert_docx_to_markdown(docx_path):
     """Converts a DOCX file to markdown text."""
     try:
@@ -232,32 +251,10 @@ def convert_docx_to_markdown(docx_path):
     except Exception as e:
         return f"Error reading DOCX: {e}"
 
-def handle_greeting(client: NewClient, chat, sender_id, sender_name, text):
-    """Handles first-time greeting for a new conversation."""
-    # Start timer for minimum response delay
-    min_total_delay = random.uniform(2, 5)
-    start_time = time.time()
-
-    greeting = generate_first_time_greeting(
-        sender_name, text,
-        public_prompts["greeting"],
-        private_prompts["greeting"]
-    )
-
-    # Calculate remaining delay time
-    elapsed = time.time() - start_time
-    remaining = min_total_delay - elapsed
-    if remaining > 0:
-        time.sleep(remaining)
-
-    client.send_message(chat, greeting)
-    client.send_chat_presence(jid=chat, state=ChatPresence.CHAT_PRESENCE_PAUSED, media=ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT)
-    log.info(f"Sent greeting to {sender_name} ({sender_id}).")
-    save_message(sender_id, greeting, int(time.time()), True)
 
 def handle_file(client: NewClient, sender_id, message):
     """Handles file attachments (downloads the file)."""
-    if sender_id not in ADMIN_NUMBERS:
+    if norm_phone(sender_id) not in ADMIN_NUMBERS:
         log.info(f"Files from {sender_id} are not allowed.")
         return False
 
@@ -297,15 +294,36 @@ def handle_file(client: NewClient, sender_id, message):
 
     return True
 
-def handle_commands(client: NewClient, chat, sender_id, text: str) -> bool:
+
+def _format_sessions(rows: list) -> str:
+    """Format a session listing for chat (numbered refs usable with !resume/!delete)."""
+    lines = []
+    for i, r in enumerate(rows, start=1):
+        title = r["title"] or r["id"]
+        line = f"{i}. {r['id']} {title}"
+        if r["message_count"]:
+            line += f" ({r['message_count']} msgs)"
+        if r["last_activity_at"]:
+            line += f", {time.strftime('%Y-%m-%d %H:%M', time.localtime(r['last_activity_at']))}"
+        if r["preview"]:
+            line += f" — {r['preview']}"
+        if r["is_current"]:
+            line += " [current]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def handle_commands(client: NewClient, chat, sender_id, sender_name, text: str,
+                    is_group: bool, is_self: bool) -> bool:
     """
     Checks for special commands. If one of the commands is detected and the sender's number
     matches a specific number, it sends back pre-formatted info and returns True.
+    Commands are control messages: they are not stored in the session history.
     """
     if not text.startswith("!") or not text.strip():
         return
 
-    if sender_id not in ADMIN_NUMBERS:
+    if norm_phone(sender_id) not in ADMIN_NUMBERS:
         log.info(f"Command {text} from {sender_id} not allowed.")
         return False
 
@@ -320,6 +338,8 @@ def handle_commands(client: NewClient, chat, sender_id, text: str) -> bool:
     # Add a variable delay before responding
     delay = random.uniform(2, 5)
     time.sleep(delay)
+    key = session_key_for(is_group, is_self, chat, sender_id)
+
     if text.startswith("!files"):
         # Get list of files in the downloads folder
         downloads_folder = "./downloads"
@@ -373,43 +393,23 @@ def handle_commands(client: NewClient, chat, sender_id, text: str) -> bool:
         commands = ["!commands - Show available commands",
                     "!files - List files in the downloads folder",
                     "!removefile <ID or filename> - Remove a file from the downloads folder",
-                    "!prompts - Show available prompts",
-                    "!editprompt <prompt_name> <new_content> - Edit a prompt",
                     "!renamebot <new_name> - Change the bot's name",
+                    "!new - Start a new session (the current one stays saved)",
+                    "!title [name] - Show or set the current session title",
+                    "!sessions [search] - List sessions for this chat (or search them)",
+                    "!resume <number|id|title> - Resume a saved session (!resume alone resumes the bot)",
+                    "!delete <number|id|title> - Delete a session",
                     "!memory - Show your session/memory stats",
                     "!facts - List stored facts about you",
                     "!forget <ID> - Delete a specific fact by ID",
                     "!stats - Show full memory/stats overview",
-                    "!reset - Clear your conversation history",
+                    "!reset - Clear all sessions for this chat",
                     "!pause - Pause the bot",
                     "!resume - Resume the bot",
                     "!permanentstop - Stop the bot permanently"]
         commands_joined = "\n".join(commands)
         client.send_message(chat, f"[COMMAND] Available commands:\n{commands_joined}")
         log.info(f"Processed !commands command for {sender_id}.")
-        return True
-    elif text.startswith("!prompts"):
-        prompts = [
-            f"greeting: {public_prompts['greeting']}",
-            f"final_response: {public_prompts['final_response']}"
-        ]
-        prompts_joined = "\n".join(prompts)
-        client.send_message(chat, f"[COMMAND] Public prompts (editable):\n\n{prompts_joined}")
-        log.info(f"Processed !prompts command for {sender_id}.")
-        return True
-    elif text.startswith("!editprompt"):
-        parts = text.split(" ", 2)
-        if len(parts) < 3:
-            client.send_message(chat, "[COMMAND] Provide the prompt name and new content.")
-            return True
-        prompt_name = parts[1]
-        new_prompt_content = parts[2]
-        if prompt_name not in public_prompts:
-            client.send_message(chat, f"[COMMAND] Unknown prompt name: {prompt_name}")
-            return True
-        public_prompts[prompt_name] = new_prompt_content
-        client.send_message(chat, f"[COMMAND] Public prompt {prompt_name} updated.")
-        log.info(f"Processed !editprompt command for {sender_id} and prompt {prompt_name}.")
         return True
     elif text.startswith("!renamebot"):
         parts = text.split(" ", 1)
@@ -423,18 +423,88 @@ def handle_commands(client: NewClient, chat, sender_id, text: str) -> bool:
         client.send_message(chat, f"[COMMAND] Bot name updated: {new_bot_name}.")
         log.info(f"Processed !renamebot command for {sender_id}. New name: {new_bot_name}")
         return True
+    elif text.startswith("!new"):
+        had = store.current_session(key) is not None
+        store.end_current(key, "new")
+        if had:
+            client.send_message(chat, "[COMMAND] New session started. The previous one is saved — use !sessions to find it and !resume <number> to go back.")
+        else:
+            client.send_message(chat, "[COMMAND] New session started.")
+        log.info(f"Processed !new command for {sender_id}.")
+        return True
+    elif text.startswith("!title"):
+        current = store.current_session(key)
+        if not current:
+            client.send_message(chat, "[COMMAND] No active session for this chat.")
+            return True
+        parts = text.split(" ", 1)
+        if len(parts) < 2 or not parts[1].strip():
+            client.send_message(chat, f"[COMMAND] Current title: {current['title'] or '(none)'}")
+            return True
+        store.set_title(current["id"], parts[1].strip())
+        client.send_message(chat, "[COMMAND] Session title set.")
+        log.info(f"Processed !title command for {sender_id}.")
+        return True
+    elif text.startswith("!sessions"):
+        parts = text.split(" ", 1)
+        query = parts[1].strip() if len(parts) > 1 else ""
+        rows = store.search_sessions(key, query) if query else store.list_sessions(key)
+        if not rows:
+            client.send_message(chat, f"[COMMAND] No sessions found." + (f" (search: {query})" if query else ""))
+        else:
+            client.send_message(chat, f"[COMMAND] Sessions for this chat:\n" + _format_sessions(rows))
+        log.info(f"Processed !sessions command for {sender_id}.")
+        return True
+    elif text.startswith("!resume"):
+        parts = text.split(" ", 1)
+        if len(parts) < 2 or not parts[1].strip():
+            # Bare !resume = bot resume (legacy behavior)
+            is_bot_running = True
+            client.send_message(chat, "[COMMAND] Bot has resumed!")
+            log.info(f"Processed !resume (bot) command for {sender_id}.")
+            return True
+        ref = parts[1].strip()
+        sid = store.resolve(key, ref)
+        if not sid:
+            client.send_message(chat, f"[COMMAND] No session matches: {ref}")
+            return True
+        store.resume(key, sid)
+        title = store.session_title(sid)
+        client.send_message(chat, f"[COMMAND] Resumed session {sid} ({title or 'untitled'}).")
+        log.info(f"Processed !resume command for {sender_id}: {sid}.")
+        return True
+    elif text.startswith("!delete"):
+        parts = text.split(" ", 1)
+        if len(parts) < 2 or not parts[1].strip():
+            client.send_message(chat, "[COMMAND] Usage: !delete <number|id|title>. Use !sessions to list.")
+            return True
+        ref = parts[1].strip()
+        sid = store.resolve(key, ref)
+        if not sid:
+            client.send_message(chat, f"[COMMAND] No session matches: {ref}")
+            return True
+        result = store.delete_session(key, sid)
+        extra = " A fresh session was started for this chat." if result.get("new_session") else ""
+        client.send_message(chat, f"[COMMAND] Deleted session {result['id']} ({result['title'] or 'untitled'}).{extra}")
+        log.info(f"Processed !delete command for {sender_id}: {sid}.")
+        return True
     elif text.startswith("!memory"):
-        stats = get_session_stats(sender_id)
-        gap_str = f"{stats['session_gap_seconds'] // 60} min ago" if stats['session_gap_seconds'] is not None else "never"
-        age_str = f"{stats['session_age_seconds'] // 60} min" if stats['session_age_seconds'] else "new"
-        first_str = "yes (first ever)" if stats['is_first_ever'] else ("yes (after gap)" if stats['is_new_session'] else "no")
+        session = store.current_session(key)
+        fact_count = get_fact_count(sender_id)
+        if not session:
+            client.send_message(chat, f"[COMMAND] No session for {sender_id}. Facts stored: {fact_count}")
+            return True
+        summary_text, _ = store.get_summary(session["id"])
+        started = time.strftime("%Y-%m-%d %H:%M", time.localtime(session["started_at"])) if session["started_at"] else "-"
+        last = time.strftime("%Y-%m-%d %H:%M", time.localtime(session["last_activity_at"])) if session["last_activity_at"] else "-"
         msg = (
-            f"[COMMAND] Memory stats for {sender_id}:\n"
-            f"- Total messages: {stats['message_count']}\n"
-            f"- Current session: {age_str}\n"
-            f"- Last message: {gap_str}\n"
-            f"- New session: {first_str}\n"
-            f"- Est. storage: {stats['estimated_bytes'] // 1024} KB"
+            f"[COMMAND] Memory for {sender_id}:\n"
+            f"- Session: {session['id']}\n"
+            f"- Messages: {session['message_count']}\n"
+            f"- Started: {started}\n"
+            f"- Last active: {last}\n"
+            f"- Summary: {len(summary_text) if summary_text else 0} chars\n"
+            f"- Facts stored: {fact_count}"
         )
         client.send_message(chat, msg)
         log.info(f"Processed !memory command for {sender_id}.")
@@ -468,36 +538,29 @@ def handle_commands(client: NewClient, chat, sender_id, text: str) -> bool:
             client.send_message(chat, f"[COMMAND] Fact [{fact_id}] not found.")
         return True
     elif text.startswith("!stats"):
-        stats = get_session_stats(sender_id)
+        session = store.current_session(key)
+        s = store.stats()
         fact_count = get_fact_count(sender_id)
-        summary_text, _ = get_summary(sender_id)
-        summary_size = len(summary_text) if summary_text else 0
-        gap_str = f"{stats['session_gap_seconds'] // 60} min ago" if stats['session_gap_seconds'] is not None else "never"
-        msg = (
-            f"[COMMAND] Stats for {sender_id}:\n"
-            f"- Messages: {stats['message_count']}\n"
-            f"- Facts stored: {fact_count}\n"
-            f"- Summary: {summary_size} chars\n"
-            f"- Last message: {gap_str}\n"
-            f"- Est. storage: {stats['estimated_bytes'] // 1024} KB"
-        )
-        client.send_message(chat, msg)
+        lines = [
+            f"[COMMAND] Stats for {sender_id}:",
+            f"- Sessions: {s['total_sessions']} total ({s['named_sessions']} named)",
+            f"- Messages: {s['total_messages']}",
+            f"- Facts stored: {fact_count}",
+        ]
+        if session:
+            lines.append(f"- Current session: {session['id']} ({session['message_count']} msgs)")
+        client.send_message(chat, "\n".join(lines))
         log.info(f"Processed !stats command for {sender_id}.")
         return True
     elif text.startswith("!reset"):
-        client.send_message(chat, "[COMMAND] Conversation history cleared!")
-        delete_messages(sender_id)
-        log.info(f"Cleared conversation history for {sender_id} due to '!reset' command.")
+        deleted = store.reset_key(key)
+        client.send_message(chat, f"[COMMAND] All sessions for this chat cleared ({deleted} deleted).")
+        log.info(f"Reset {deleted} sessions for {sender_id} due to '!reset' command.")
         return True
     elif text.startswith("!pause"):
         client.send_message(chat, "[COMMAND] Bot is now paused!")
         is_bot_running = False
         log.info(f"Processed !pause command for {sender_id}.")
-        return True
-    elif text.startswith("!resume"):
-        client.send_message(chat, "[COMMAND] Bot has resumed!")
-        is_bot_running = True
-        log.info(f"Processed !resume command for {sender_id}.")
         return True
     elif text.startswith("!permanentstop"):
         client.send_message(chat, "[COMMAND] Bot is shutting down permanently!")
@@ -511,37 +574,22 @@ def handle_commands(client: NewClient, chat, sender_id, text: str) -> bool:
 
     return False
 
-def handle_final_response(client: NewClient, chat, sender_id, text, user_name: str = "User"):
-    """Generates and sends the final response using the LLM, with watchdog check."""
-    from llm import call_watchdog_llm
 
+def handle_final_response(client: NewClient, chat, sender_id, sender_name, text,
+                          is_group: bool, is_self: bool, session_id, session_note: str):
+    """Generates and sends the reply for the current turn (single pipeline:
+    SOUL.md system prompt + session history + this message)."""
     # Start timer for minimum response delay
     min_total_delay = random.uniform(2, 5)
     start_time = time.time()
 
-    is_relevant, response = call_watchdog_llm(text, private_prompts["watchdog"])
-    if not is_relevant:
-        # Watchdog blocked the message -- stay silent, no reply sent.
-        # (Old behavior: sent the watchdog's canned response to the user.)
-        # # Calculate remaining delay time
-        # elapsed = time.time() - start_time
-        # remaining = min_total_delay - elapsed
-        # if remaining > 0:
-        #     time.sleep(remaining)
-        #
-        # client.send_message(chat, response)
-        log.info(f"Watchdog blocked response for {sender_id}. Message not relevant.")
-        return
-
+    owner = is_self or is_owner_sender(sender_id, sender_name)
     final_answer = generate_final_response(
-        user_id=sender_id,
-        user_text=text,
-        public_prompt=public_prompts["final_response"],
-        private_prompt=private_prompts["final_response"],
-        user_name=user_name,
+        store, session_id, sender_id, text, sender_name,
+        is_group, owner, session_note,
     )
     log.debug(f"Final answer generated: {final_answer}")
-    if not final_answer.strip():
+    if not final_answer or not final_answer.strip():
         log.info(f"No final response generated for {sender_id}.")
         return
 
@@ -553,12 +601,14 @@ def handle_final_response(client: NewClient, chat, sender_id, text, user_name: s
 
     client.send_message(chat, final_answer)
     client.send_chat_presence(jid=chat, state=ChatPresence.CHAT_PRESENCE_PAUSED, media=ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT)
-    save_message(sender_id, final_answer, int(time.time()), True)
+    store.append(session_id, ("assistant", final_answer), user_id=sender_id, sender=None,
+                 timestamp=time.time())
     log.info(f"Sent final response to {sender_id}.")
+
 
 def on_history_sync(client: NewClient, history: HistorySyncEv):
     """
-    Processes historical messages from the sync data, storing them in the DB.
+    Processes historical messages from the sync data, storing them in the session store.
     The data structure is at `history.Data.conversations[...]`.
     """
     sync_type = getattr(history.Data, "syncType", None)
@@ -570,8 +620,17 @@ def on_history_sync(client: NewClient, history: HistorySyncEv):
         return
 
     for conversation in history.Data.conversations:
-        user_id = conversation.ID.split('@')[0]  # e.g. phone number
-        log.debug(f"Processing conversation for user {user_id}")
+        conv_id = conversation.ID  # e.g. '628123456789@s.whatsapp.net' or '123-456@g.us'
+        is_group_conv = conv_id.endswith("@g.us")
+        user_id = conv_id.split("@")[0]  # phone number or group id
+        log.debug(f"Processing conversation {conv_id}")
+
+        if is_group_conv:
+            key = f"ch-{conv_id}"
+        else:
+            key = f"dm-{user_id}"
+        session_id = store.ensure_session(key, user_id)
+
         for message_obj in conversation.messages:
             message_data = message_obj.message
             msg = message_data.message
@@ -588,11 +647,15 @@ def on_history_sync(client: NewClient, history: HistorySyncEv):
                 continue
 
             timestamp = message_obj.message.messageTimestamp
-            log.debug(f"Saving message with timestamp {timestamp} for user {user_id}")
-            save_message(user_id, message_content, timestamp, from_me)
+            role = "assistant" if from_me else "user"
+            store.append(session_id, (role, message_content), user_id=user_id,
+                         sender=None, timestamp=timestamp)
+            log.debug(f"Saved {role} message (ts={timestamp}) into {session_id}.")
+
 
 # Rate limiting: user_id -> deque of timestamps (seconds)
 user_message_timestamps = defaultdict(lambda: deque(maxlen=5))
+
 
 def can_respond_to_user(user_id):
     now = time.time()
@@ -602,8 +665,10 @@ def can_respond_to_user(user_id):
         timestamps.popleft()
     return len(timestamps) < 5
 
+
 def record_user_response(user_id):
     user_message_timestamps[user_id].append(time.time())
+
 
 def _extract_facts_async(user_id, user_message):
     """Background thread: extract facts from a message without blocking the response."""
@@ -612,16 +677,17 @@ def _extract_facts_async(user_id, user_message):
     except Exception as e:
         log.error(f"Fact extraction error for {user_id}: {e}")
 
+
 def _cleanup_thread():
     """
-    Background thread: runs every 6 hours to prune old messages and stale facts.
+    Background thread: runs every 6 hours to prune old session messages and stale facts.
     Also logs a memory report.
     """
     CLEANUP_INTERVAL = 6 * 3600  # 6 hours
     while True:
         time.sleep(CLEANUP_INTERVAL)
         try:
-            pruned_msgs = prune_old_messages()
+            pruned_msgs = store.prune_old_messages()
             pruned_facts = prune_stale_facts()
             fact_count = get_fact_count()
             log.info(
@@ -631,11 +697,13 @@ def _cleanup_thread():
         except Exception as e:
             log.error(f"[CLEANUP] Error: {e}")
 
+
 def start_cleanup_thread():
     """Start the background cleanup thread (daemon)."""
     t = threading.Thread(target=_cleanup_thread, daemon=True)
     t.start()
     log.info("Cleanup thread started (runs every 6h).")
+
 
 def on_message(client: NewClient, message: MessageEv):
     """
@@ -651,7 +719,6 @@ def on_message(client: NewClient, message: MessageEv):
                 message.Message.imageMessage.caption or
                 message.Message.documentMessage.caption or
                 "")
-        from_me = message.Info.MessageSource.IsFromMe
         is_group = message.Info.MessageSource.IsGroup
         is_edit = message.IsEdit
         is_viewonce = message.IsViewOnce or message.IsViewOnceV2 or message.IsViewOnceV2Extension
@@ -668,8 +735,10 @@ def on_message(client: NewClient, message: MessageEv):
         # Resolve LID -> phone before the self-chat check.
         # Self-chat JIDs from get_me() are phone-based, but incoming messages
         # may carry a LID. Without this, is_self_chat() can't match.
-        sender_phone = resolve_sender_phone(client, chat)
-        if sender_phone and sender_phone != sender_id:
+        # In groups the chat JID is the group, so resolve the actual sender instead.
+        identity_jid = message.Info.MessageSource.Sender if is_group else chat
+        sender_phone = resolve_sender_phone(client, identity_jid)
+        if not is_group and sender_phone and sender_phone != sender_id:
             log.info(f"Resolved LID {sender_id} -> {sender_phone}")
             sender_id = sender_phone
 
@@ -696,22 +765,33 @@ def on_message(client: NewClient, message: MessageEv):
         # --- Reply gating ---
         settings = get_settings()
         if is_group:
-            # Rule 1: group replies are ALWAYS disabled unless @mentioned
-            # (and only when the group_mention toggle is on).
-            if settings["group_mention"] and is_bot_mentioned(message, bot_jid):
-                sender_id = message.Info.MessageSource.Sender or sender_id
+            # Groups use one shared session (ch-<group>). With group_mention on,
+            # every message is recorded into it (so the bot has read the whole
+            # conversation); a reply is only generated when @mentioned.
+            if not settings["group_mention"]:
+                log.info(f"Skipping group message from {sender_id} (group_mention off).")
+                return
+            sender_id = resolve_sender_phone(client, message.Info.MessageSource.Sender) or sender_id
+            if is_bot_mentioned(message, bot_jid):
                 log.info(f"Group @mention (enabled): processing from {sender_name} ({sender_id}).")
             else:
-                log.info(f"Skipping group message from {sender_id} (group replies always off; mention={settings['group_mention']}).")
+                if not _whitelisted(sender_id):
+                    log.info(f"Group context from {sender_id} not whitelisted; not recorded.")
+                    return
+                key = session_key_for(True, False, chat, sender_id)
+                session_id = store.ensure_session(key, sender_id)
+                store.append(session_id, ("user", text), user_id=sender_id,
+                             sender=sender_name, timestamp=timestamp)
+                log.info(f"Recorded group context from {sender_name} into {session_id}.")
                 return
         elif is_self:
-            # Rule 4: self-chat replies (default on, toggleable)
+            # Self-chat replies (default on, toggleable)
             if not settings["self_chat"]:
                 log.info(f"Skipping self-chat message (self_chat toggle off).")
                 return
             log.info(f"Self-chat message: processing.")
         else:
-            # Rule 3: DM replies (default off, toggleable)
+            # DM replies (default off, toggleable)
             if not settings["dm"]:
                 log.info(f"Skipping DM from {sender_id} (dm toggle off).")
                 return
@@ -731,15 +811,11 @@ def on_message(client: NewClient, message: MessageEv):
         )
         log.info(f"Marked message {message.Info.ID} as read.")
 
-        # Save the incoming message to the DB
-        save_message(sender_id, text, timestamp, from_me)
-        log.info(f"Saved incoming message for user {sender_id} at timestamp {timestamp}.")
-
         client.send_chat_presence(jid=chat, state=ChatPresence.CHAT_PRESENCE_COMPOSING, media=ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT)
 
         # Check for a command and process it if present.
-        if handle_commands(client, chat, sender_id, text):
-            # If a command was processed, do not process further.
+        # Commands are control messages: they are not stored in the session.
+        if handle_commands(client, chat, sender_id, sender_name, text, is_group, is_self):
             client.send_chat_presence(jid=chat, state=ChatPresence.CHAT_PRESENCE_PAUSED, media=ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT)
             return
 
@@ -754,43 +830,37 @@ def on_message(client: NewClient, message: MessageEv):
             return
 
         # Whitelist: only reply to allowed phone numbers.
-        # sender_id may be a LID (in groups) -> resolve to phone first.
-        if REPLY_WHITELIST and "*" not in REPLY_WHITELIST:
-            sender_phone = resolve_sender_phone(client, message.Info.MessageSource.Sender or message.Info.MessageSource.Chat)
-            if not sender_phone:
-                sender_phone = sender_id
-            # Normalize: strip '+', '@', ':N' device suffix, and whitespace so
-            # format differences (e.g. '6281234567890:52' vs '6281234567890') don't matter.
-            norm = lambda s: s.strip().lstrip("+").replace("@", "").split(":", 1)[0]
-            sender_normalized = norm(sender_phone)
-            whitelist_normalized = {norm(num) for num in REPLY_WHITELIST}
-            if sender_normalized not in whitelist_normalized:
-                log.info(f"User {sender_id} (phone={sender_phone}) not in reply whitelist; skipping response.")
-                return
+        if not _whitelisted(sender_phone or sender_id):
+            log.info(f"User {sender_id} (phone={sender_phone}) not in reply whitelist; skipping response.")
+            return
 
         # Rate limiting: only respond if under the limit
         if not can_respond_to_user(sender_id):
             log.info(f"Rate limit reached for {sender_id}; skipping response.")
             return
 
-        # Session detection
-        is_new, is_first = is_new_session(sender_id)
-        stats = get_session_stats(sender_id)
-        log.info(f"User {sender_id}: new_session={is_new}, first_ever={is_first}, "
-                 f"messages={stats['message_count']}, gap={stats['session_gap_seconds']}s")
+        # Session: one shared session per chat (DM / self / group).
+        key = session_key_for(is_group, is_self, chat, sender_id)
+        session_id = store.ensure_session(key, sender_id)
+        session = store.current_session(key)
+        session_note = _session_note(session)
+        log.info(f"User {sender_id}: session={session_id}, "
+                 f"messages={session['message_count'] if session else 0}")
+        store.append(session_id, ("user", text), user_id=sender_id,
+                     sender=sender_name, timestamp=timestamp)
 
-        # Prune old messages (fire-and-forget, non-blocking)
-        if not is_new and stats["message_count"] > 100:
-            pruned = prune_old_messages(sender_id)
+        # Prune messages older than the memory cutoff (keeps the session lean).
+        if session and session["message_count"] > 100:
+            pruned = store.prune_old_messages(session_id)
             if pruned:
-                log.info(f"Pruned {pruned} old messages for {sender_id}.")
+                log.info(f"Pruned {pruned} old messages from {session_id}.")
 
-        # Phase 2: Summarize older messages if the conversation exceeds the verbatim tail.
+        # Summarize older turns once the session outgrows the verbatim tail.
         # This keeps the context window within budget while preserving long-term memory.
-        if not is_first and stats["message_count"] > VERBATIM_TURNS:
-            summarize_session(sender_id)
+        if store.user_message_count(session_id) > VERBATIM_TURNS:
+            summarize_session(store, session_id, sender_id)
 
-        # Phase 3: Extract facts asynchronously (non-blocking).
+        # Extract facts asynchronously (non-blocking).
         # Runs in a background thread so it doesn't delay the user's response.
         threading.Thread(
             target=_extract_facts_async,
@@ -798,14 +868,9 @@ def on_message(client: NewClient, message: MessageEv):
             daemon=True
         ).start()
 
-        # Process greeting for a first-time message
-        if is_first:
-            handle_greeting(client, chat, sender_id, sender_name, text)
-            record_user_response(sender_id)
-            return
-
-        log.info(f"Generating final response for {sender_id}...")
-        handle_final_response(client, chat, sender_id, text, sender_name)
+        log.info(f"Generating response for {sender_id}...")
+        handle_final_response(client, chat, sender_id, sender_name, text,
+                              is_group, is_self, session_id, session_note)
         record_user_response(sender_id)
 
     except Exception as e:

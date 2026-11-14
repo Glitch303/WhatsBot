@@ -1,73 +1,143 @@
 # Architecture
 
-System design, message flow, threading model, and state management for WhatsBot.
+How WhatsBot works under the hood: components, message flow, threading, state, and error handling.
+
+---
+
+## Overview
+
+WhatsBot is a personal WhatsApp assistant built on [neonize](https://github.com/evkloev/neonize) (a Python client for WhatsApp Web via whatsmeow). It runs as a **single-process CLI app** with an interactive terminal menu.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      WHATSBOT                               │
+│                                                             │
+│  ┌─────────────┐    ┌───────────────────────────────────┐   │
+│  │   Menu      │    │      Message Pipeline             │   │
+│  │  (terminal) │    │                                   │   │
+│  │             │    │  on_message()                     │   │
+│  │  model      │    │    ├── identity + LID resolve     │   │
+│  │  settings   │    │    ├── gate (dm/group/self)       │   │
+│  │  sessions   │    │    ├── commands / files           │   │
+│  │  live view  │    │    ├── session store (SQLite)     │   │
+│  │             │    │    ├── summarize + facts (bg)     │   │
+│  │             │    │    └── LLM → reply                │   │
+│  └──────┬──────┘    └───────────────┬───────────────────┘   │
+│         │                           │                       │
+│         ▼                           ▼                       │
+│  ┌─────────────┐    ┌───────────────────────────────────┐   │
+│  │   config    │    │      neonize client               │   │
+│  │   (env)     │    │      (WhatsApp Web)               │   │
+│  └─────────────┘    └───────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Components
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         main.py (entry point)                       │
-│                                                                     │
-│  configure_logging()                                                │
-│  init_db() + start_cleanup_thread()                                 │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │  run_menu()  ←  menu.py                                    │   │
-│  │                                                            │   │
-│  │  connect_fn()     ← creates Neonize client + event handlers│   │
-│  │  start_bot_fn()   ← set_bot_running(True)                   │   │
-│  │  stop_bot_fn()    ← set_bot_running(False)                  │   │
-│  │  disconnect_fn()  ← set_bot_running(False) + client.disc() │   │
-│  │                                                            │   │
-│  │  run_live_view()  ← live log view (stdin reader)           │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-│  Neonize event handlers (in main.py, called by neonize event loop): │
-│    on_connected()   → set presence, set_bot_running(False)          │
-│    on_history_sync()→ whatsapp.on_history_sync()                    │
-│    on_message()     → whatsapp.on_message()                         │
-│    on_qr()          → print QR code                                 │
-└─────────────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                       whatsapp.py (message handler)                  │
-│                                                                     │
-│  on_message()          — main pipeline (see Message Flow below)     │
-│  handle_commands()     — !commands, !files, !reset, etc.            │
-│  handle_reply_commands() — !replies, !status                        │
-│  handle_file()         — PDF/DOCX/TXT ingestion                     │
-│  handle_greeting()     — first-time greeting                        │
-│  handle_final_response() — watchdog + LLM call + send               │
-│  resolve_sender_phone() — LID → phone (cached)                      │
-│  is_self_chat()        — self-chat detection                        │
-│  is_bot_mentioned()    — group @mention check                       │
-└─────────────────────────────────────────────────────────────────────┘
-         │
-         ├──► llm.py
-         │       get_client_and_model()   — provider-specific client
-         │       call_llm_api()           — unified chat completion
-         │       call_watchdog_llm()      — structured JSON filter
-         │       generate_final_response() — context + prompt + call
-         │       generate_first_time_greeting()
-         │       summarize_session()      — rolling summary
-         │       extract_facts()          — fact extraction
-         │       build_context()          — budget-aware context
-         │
-         ├──► database.py
-         │       messages table     — all conversation messages
-         │       summaries table    — rolling conversation summaries
-         │       facts table        — durable extracted facts
-         │
-         ├──► bot_settings.py
-         │       _bot_settings dict — {group_mention, dm, self_chat}
-         │       get_settings()     — thread-safe read
-         │       toggle()           — thread-safe write
-         │
-         └──► config.py
-                 All env vars loaded once at import time
+WhatsBot/
+├── main.py               — entry point
+├── menu.py               — terminal menu + live view
+├── whatsapp.py           — message pipeline
+├── llm.py                — LLM calls + conversation assembly
+├── sessionstore.py       — session store (SQLite, persistent conn)
+├── database.py           — facts table (per-user durable facts)
+├── prompts.py            — prompt scaffolding (group note, summary, facts)
+├── config.py             — env vars + SOUL.md loader
+├── bot_settings.py       — runtime reply toggles (dm, group, self_chat)
+├── SOUL.md               — the persona (gitignored, re-read every message)
+├── SOUL.example.md       — public template for SOUL.md
+├── .env                  — secrets (gitignored)
+├── db/
+│   └── conversations.sqlite3  — sessions, messages, summaries, facts
+└── docs/                 — this documentation
 ```
+
+### `main.py`
+
+- Loads `.env`, sets up logging to `app.log`.
+- Creates runtime directories (`db/`, `downloads/`, `converted/`).
+- `init_db()` — creates the `facts` table (sessionstore handles its own tables).
+- `start_cleanup_thread()` — background pruning thread.
+- Runs `run_menu()` with connect/start/disconnect/stop callbacks.
+- On exit: disconnects the client and `os._exit(0)`.
+
+### `menu.py`
+
+- `run_menu()` — main loop: standby menu → connect → live view → back to menu.
+- `run_live_view()` — displays log output in real time; reads stdin via `select()` with a 0.1s timeout.
+- `install_log_capture()` — mirrors all logging records to a queue for the live view.
+- `_runtime` dict — holds LLM overrides (`provider`, `model`, `base_url`) set by the model picker; read by `llm.get_client_and_model()`.
+- `print_sessions_menu()` — read-only ledger overview (`store.stats()`).
+
+### `whatsapp.py`
+
+```
+on_message()            — main pipeline (see Message Flow below)
+on_history_sync()       — backfills synced messages into sessions
+handle_commands()       — !new, !title, !sessions, !resume, !delete, !reset, ...
+handle_reply_commands() — !replies, !status (no delay)
+handle_file()           — PDF/DOCX/TXT ingestion → converted/*.txt
+handle_final_response() — LLM call + send + store assistant reply
+resolve_sender_phone()  — LID → phone (cached)
+is_self_chat()          — self-chat detection
+is_bot_mentioned()      — group @mention check
+session_key_for()       — dm-{phone} | self | ch-{group jid}
+_session_note()         — first-ever / new-session context note
+```
+
+### `llm.py`
+
+```
+get_client_and_model()    — provider-specific client (openai/azure/openrouter/llamacpp)
+call_llm_api()            — unified chat completion (takes a messages list)
+is_owner()                — owner detection (OWNER_NUMBER exact, else pushname)
+build_system_prompt()     — SOUL.md + owner/group note + session note + memory blocks
+build_convo()             — [system] + history + current user turn
+generate_final_response() — assemble + call + return reply text
+summarize_session()       — rolling summary (per session)
+extract_facts()           — fact extraction (per user)
+```
+
+### `sessionstore.py`
+
+`SessionStore` class (ported from the DiscordBot session store) with a **single persistent SQLite connection** (WAL mode) guarded by a re-entrant lock.
+
+```
+ensure_session(key)       — active session for a chat, or create one
+append(session_id, ...)   — store a message (user/assistant), bump activity
+end_current(key, reason)  — end active session + create a fresh one
+resume(key, id)           — rebind a chat to a previous session
+resolve(key, ref)         — number | title | session id → session id
+delete_session(key, id)   — delete (bound → create replacement)
+reset_key(key)            — delete all sessions for a chat + fresh bind
+history(session_id, ...)  — last N user turns + replies (oldest first, [Name] labels)
+user_message_count()      — user turns in a session
+prune_old_messages()      — prune by age
+save_summary()/get_summary() — per-session rolling summary
+list_sessions()/search_sessions() — ledger (up to 15 rows)
+stats()                   — totals + current binding per chat (menu view)
+```
+
+Module-level `store = SessionStore(CONV_DB_PATH)` — created at import (imported by `whatsapp.py`/`menu.py`), so migration runs at startup before any message.
+
+### `database.py`
+
+Facts table only (per-user durable facts): `save_fact`, `get_facts`, `delete_fact`, `get_fact_count`, `prune_stale_facts`, `init_db`.
+
+### `prompts.py`
+
+Prompt scaffolding: `GROUP_CHAT_NOTE` (group rules: `[Name]` labels, speak only on @mention, pronouns point at the speaker), `SUMMARY_SYSTEM_PROMPT` (rolling summary merge), `FACT_EXTRACTION_PROMPT` (JSON fact extraction). No persona lives here — the persona is `SOUL.md`.
+
+### `config.py`
+
+All env vars loaded once at import. `SOUL_PATH` is anchored to the project root; `load_soul()` re-reads `SOUL.md` on every call (falls back to `DEFAULT_PERSONA` if missing/empty). Owner identity: `OWNER_NAME` (default `Owner`) + `OWNER_NUMBER` (optional exact phone).
+
+### `bot_settings.py`
+
+Runtime reply toggles: `{group_mention, dm, self_chat}` with `get_settings()` / `toggle()` (thread-safe). Defaults: `group_mention=False`, `dm=True`, `self_chat=True`.
 
 ---
 
@@ -80,14 +150,15 @@ whatsapp.on_message(client, message)
 │     chat = message.Info.MessageSource.Chat
 │     sender_id = chat.User
 │     text = conversation / extendedTextMessage.text / caption
-│     from_me, is_group, is_edit, is_viewonce, timestamp, sender_name
+│     is_group, is_edit, is_viewonce, timestamp, sender_name
 │
 ├── 2. IDENTITY
 │     bot_jid = get_bot_jid(client)
 │     if _self_chat_jid is None: set_self_chat_jid(bot_jid)
 │
-│     sender_phone = resolve_sender_phone(client, chat)
-│     if sender_phone != sender_id:
+│     identity_jid = Sender (groups) else Chat
+│     sender_phone = resolve_sender_phone(client, identity_jid)
+│     if not is_group and sender_phone != sender_id:
 │         log "Resolved LID ..."
 │         sender_id = sender_phone
 │
@@ -101,9 +172,14 @@ whatsapp.on_message(client, message)
 │     settings = get_settings()
 │
 │     if is_group:
-│         if group_mention ON AND is_bot_mentioned:
-│             sender_id = message.Info.MessageSource.Sender
-│         else: return  (skip)
+│         if not group_mention: return
+│         sender_id = resolve_sender_phone(Sender) or sender_id
+│         if is_bot_mentioned: → process (below)
+│         else:
+│             if whitelisted:
+│                 session_id = store.ensure_session("ch-{group}")
+│                 store.append(session_id, ("user", text), sender=sender_name)
+│             return   (context only, no reply)
 │
 │     elif is_self:
 │         if not self_chat: return
@@ -114,15 +190,16 @@ whatsapp.on_message(client, message)
 ├── 5. FRESHNESS
 │     if time.time() - timestamp > 60: return
 │
-├── 6. MARK READ + SAVE
+├── 6. MARK READ
 │     client.mark_read(...)
-│     save_message(sender_id, text, timestamp, from_me)
 │
 ├── 7. PRESENCE
 │     client.send_chat_presence(COMPOSING)
 │
 ├── 8. COMMANDS
-│     if handle_commands(...): return
+│     if handle_commands(...):
+│         presence PAUSED
+│         return
 │
 ├── 9. FILES
 │     if media and not url:
@@ -133,7 +210,6 @@ whatsapp.on_message(client, message)
 │
 ├── 11. WHITELIST
 │     if REPLY_WHITELIST and "*" not in it:
-│         sender_phone = resolve_sender_phone(Sender or Chat)
 │         norm = strip "+", "@", ":N", whitespace
 │         if norm(sender_phone) not in {norm(w) for w in whitelist}: return
 │
@@ -141,34 +217,39 @@ whatsapp.on_message(client, message)
 │     if not can_respond_to_user(sender_id): return
 │
 ├── 13. SESSION
-│     is_new, is_first = is_new_session(sender_id)
-│     stats = get_session_stats(sender_id)
+│     key = session_key_for(is_group, is_self, chat, sender_id)
+│     session_id = store.ensure_session(key, sender_id)
+│     session = store.current_session(key)
+│     session_note = _session_note(session)
+│     store.append(session_id, ("user", text), sender=sender_name, timestamp=...)
 │
-│     if not is_new and message_count > 100:
-│         prune_old_messages(sender_id)
+│     if session["message_count"] > 100:
+│         store.prune_old_messages(session_id)
 │
-│     if not is_first and message_count > VERBATIM_TURNS:
-│         summarize_session(sender_id)
+│     if store.user_message_count(session_id) > VERBATIM_TURNS:
+│         summarize_session(store, session_id, sender_id)
 │
 ├── 14. FACT EXTRACTION (background thread)
 │     threading.Thread(target=_extract_facts_async, ...).start()
 │
 ├── 15. RESPOND
-│     if is_first:
-│         handle_greeting()
-│     else:
-│         handle_final_response()
-│           ├── call_watchdog_llm()
-│           │     if not relevant: return (silent)
-│           │
-│           └── generate_final_response()
-│                 ├── build_context(user_id, user_text)
-│                 │     ├── facts (25% budget)
-│                 │     ├── summary (50% remaining)
-│                 │     └── verbatim tail (rest)
-│                 ├── _read_converted_files()
-│                 ├── format prompt (public + private)
-│                 └── call_llm_api()
+│     handle_final_response(...)
+│           ├── 2-5s random delay
+│           ├── owner = is_self or is_owner(sender_id, sender_name)
+│           ├── generate_final_response(store, session_id, ...)
+│           │     └── build_convo()
+│           │           ├── load_soul()          ← SOUL.md (fresh read)
+│           │           ├── owner/group note
+│           │           ├── session_note
+│           │           ├── [FACTS about this user]
+│           │           ├── [CONVERSATION SUMMARY]
+│           │           ├── [ADDITIONAL CONTENT] (converted/ files)
+│           │           ├── store.history()      ← verbatim tail
+│           │           └── current user turn
+│           │     └── call_llm_api()
+│           ├── send_message(...)
+│           ├── presence PAUSED
+│           └── store.append(session_id, ("assistant", reply))
 │
 │     record_user_response(sender_id)
 │
@@ -200,7 +281,7 @@ NEONIZE EVENT LOOP THREAD (daemon)
 
 CLEANUP THREAD (daemon)
   └── _cleanup_thread()
-        └── every 6h: prune_old_messages() + prune_stale_facts()
+        └── every 6h: store.prune_old_messages() + prune_stale_facts()
 
 FACT EXTRACTION THREADS (daemon, per-message, short-lived)
   └── _extract_facts_async()
@@ -218,8 +299,8 @@ LOG CONSUMER THREAD (daemon, only during live view)
 | **Neonize event loop in a daemon thread** | `client.connect()` blocks. Running it in a daemon thread lets the main thread run the menu. |
 | **Main thread is sole stdin reader** | Avoids race conditions between `input()` and `select()`. The live view uses `select()` with a 0.1s timeout so it can check for Ctrl+C and pending log messages. |
 | **Fact extraction in background thread** | LLM call for fact extraction can take 1-5s. Running it in a thread means the user's response isn't delayed. |
-| **Summarization is synchronous** | It only runs when `message_count > VERBATIM_TURNS` and needs the summary to be ready before the next response. Acceptable trade-off. |
-| **SQLite connections are short-lived** | Each `database.py` function opens and closes its own connection. No persistent connection pool. This avoids SQLite "database is locked" errors across threads. |
+| **Summarization is synchronous** | It only runs when user turns exceed `VERBATIM_TURNS` and needs the summary ready before the next response. Acceptable trade-off. |
+| **Store uses ONE persistent connection + `threading.RLock`** | The session store keeps a single WAL-mode SQLite connection guarded by a re-entrant lock. Neonize event callbacks and background threads share it; short-lived per-call connections caused "database is locked" races. |
 | **`pause_flag` is a mutable list** | `pause_flag = [False]` is shared between `run_menu()` and `run_live_view()`. Lists are mutable, so `pause_flag[0] = True` is visible across both without a lock (GIL makes single-element list mutation atomic). |
 | **`bot_settings` uses `threading.Lock`** | The `_bot_settings` dict is read from the Neonize thread (in `on_message`) and written from the main thread (in menu). The lock prevents torn reads. |
 
@@ -234,8 +315,6 @@ LOG CONSUMER THREAD (daemon, only during live view)
 | `is_bot_running` | `bool` | Master on/off switch. When False, non-self-chat messages are skipped. |
 | `_self_chat_jid` | `str` | The bot's own JID (e.g. `6285712345678@s.whatsapp.net`). Set on first connection. |
 | `_lid_cache` | `dict` | LID → phone number cache. Avoids re-querying the store for repeat messages. |
-| `public_prompts` | `dict` | Admin-editable prompts (greeting, final_response). Reset on restart. |
-| `private_prompts` | `dict` | Non-editable prompts (greeting, final_response, watchdog). |
 | `user_message_timestamps` | `defaultdict(deque)` | Rate limiter: last 5 response timestamps per user. |
 
 ### Global state (in `menu.py`)
@@ -253,9 +332,11 @@ LOG CONSUMER THREAD (daemon, only during live view)
 
 | Table | Purpose | Key |
 |-------|---------|-----|
-| `messages` | All conversation messages (user + bot) | `(user_id, message_content, timestamp, from_me)` |
-| `summaries` | Rolling conversation summary per user | `user_id` |
-| `facts` | Durable extracted facts per user | `(user_id, entity, fact)` |
+| `sessions` | One session per chat (ledger, resumable) | `id` (TEXT, `s-` + hex) |
+| `messages` | All session messages (user + assistant) | `id` (INTEGER) |
+| `chat_sessions` | Active session binding per chat | `session_key` |
+| `summaries` | Rolling summary per session | `session_id` |
+| `facts` | Durable extracted facts per user | `id` (INTEGER) |
 
 ---
 
@@ -301,61 +382,52 @@ def is_self_chat(chat_jid, sender_id):
 
 ```python
 self_phone = _self_chat_jid.split("@", 1)[0].split(":", 1)[0]
-if sender_phone == self_phone:
+sender_phone = sender_id.split(":", 1)[0]
+if self_phone == sender_phone:
     is_self = True
 ```
 
-**Why `IsFromMe` can't be used:** In Whatsmeow's event stream, `IsFromMe` is `True` for ALL inbound messages (both others' DMs and your own self-chat), because the phone is receiving them. It cannot distinguish self-chat from regular DMs.
+**Note:** `message.Info.IsFromMe` is **not** reliable for self-chat detection — it's `True` for all inbound messages in some neonize versions. The JID comparison is the reliable method.
 
 ---
 
 ## Connect / Start / Stop / Disconnect
 
-The menu separates **session** (WhatsApp login) from **bot** (message processing):
-
 ```
-┌──────────────┐     [3] Connect      ┌──────────────┐
-│  MENU (idle) │ ──────────────────►  │  STANDBY     │
-│  session: off│                      │  session: ON │
-└──────────────┘                      │  bot: paused │
-                                      │  self-chat: ON│
-                                      └──────┬───────┘
-                                             │
-                              [4] Start      │  [3] Disconnect
-                                             │
-                                      ┌──────▼───────┐
-                                      │  RUNNING     │
-                                      │  session: ON │
-                                      │  bot: active │
-                                      │  self-chat: ON│
-                                      │  DMs: (if ON)│
-                                      └──────┬───────┘
-                                             │
-                                      [stop] in live view
-                                             │
-                                      ┌──────▼───────┐
-                                      │  STANDBY     │
-                                      │  (as above)  │
-                                      └──────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                      STATE MACHINE                          │
+│                                                             │
+│   ┌──────────┐   connect()   ┌──────────┐                  │
+│   │  STANDBY │ ─────────────► │CONNECTED │                  │
+│   └──────────┘               └────┬─────┘                  │
+│        ▲                          │ start_bot()            │
+│        │                          ▼                        │
+│        │                   ┌──────────┐                    │
+│   stop()│                  │ RUNNING  │                    │
+│        │                   └──────────┘                    │
+│        │                          │ stop_bot()             │
+│        └──────────────────────────┘                        │
+│                                                             │
+│   disconnect() → drop WhatsApp session → STANDBY            │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-| Action | `set_bot_running` | `client.disconnect()` | `state["connected"]` |
-|--------|-------------------|----------------------|---------------------|
-| Connect | `False` (standby) | — | `True` |
-| Start | `True` | — | `True` |
-| Stop (live view) | `False` | — | `True` |
-| Disconnect | `False` | ✅ | `False` |
+| Action | What happens |
+|--------|--------------|
+| **Connect** | `client.connect()` → QR code → WhatsApp session established. Bot is connected but not responding. |
+| **Start bot** | `is_bot_running = True`. Bot begins responding to messages. |
+| **Stop bot** | `is_bot_running = False`. Bot stops responding (self-chat still works). |
+| **Disconnect** | `client.disconnect()` → WhatsApp session dropped. Back to standby. |
 
 ---
 
 ## Error Handling
 
-| Layer | Strategy |
+| Error | Handling |
 |-------|----------|
-| `on_message` | One big `try/except` around the entire pipeline. Any exception is logged with `log.exception()` (full traceback) and the handler returns. The bot keeps running. |
-| LLM calls | `call_llm_api()` catches all exceptions and returns `""`. The caller checks for empty response and skips sending. |
-| Watchdog | `_call_llm_structured()` catches JSON parse errors and returns `{}`. `call_watchdog_llm()` defaults to `(True, None)` on error — the message passes through. |
-| File conversion | `convert_pdf_to_markdown()` / `convert_docx_to_markdown()` catch exceptions and return an error string. |
-| Database | Each function opens/closes its own connection. `IntegrityError` on duplicate messages is silently ignored. |
-| Connection | `connect_fn()` waits up to 120s for `ConnectedEv`. If it times out or the user presses Ctrl+C, it calls `disconnect_fn()` and returns `False`. |
-| Process exit | `os._exit(0)` is used for hard exits (menu quit, `!permanentstop`) because the Neonize event loop thread may not stop cleanly. |
+| LLM API error | `call_llm_api()` catches all exceptions, logs, returns `""`. Bot stays silent. |
+| LID resolution failure | Falls back to the raw JID user part. Logged as a warning. |
+| File conversion failure | Logged; bot replies with an error message. |
+| Database error | Logged; the persistent store connection is retried on the next operation. |
+| Neonize disconnect | Client emits `on_disconnected`; menu shows the state. Reconnect via menu. |
+| Unknown command | Bot replies with "Unknown command. Use !commands to see available commands." |

@@ -3,7 +3,9 @@ Runtime bot settings that can be toggled at runtime via:
   - the bot's own self-chat (e.g. "!replies dm on")
   - the terminal (e.g. "replies dm on" / "status")
 
-Group replies are always disabled (hardcoded, not toggleable).
+Groups use a shared session: when group_mention is ON, every group message is
+recorded as context in the ch-{group} session and the bot only speaks when
+@mentioned. When OFF, groups are ignored entirely.
 """
 import os
 import threading
@@ -39,10 +41,9 @@ def status_text():
     s = get_settings()
     return (
         "Bot reply settings:\n"
-        f"- group mention: {'ON' if s['group_mention'] else 'off'}\n"
+        f"- group mention: {'ON' if s['group_mention'] else 'off'} (ON = shared group session, speaks on @mention)\n"
         f"- dm:            {'ON' if s['dm'] else 'off'}\n"
-        f"- self chat:     {'ON' if s['self_chat'] else 'off'}\n"
-        "- group (always): OFF (hardcoded)\n\n"
+        f"- self chat:     {'ON' if s['self_chat'] else 'off'}\n\n"
         "Toggle: !replies <group_mention|dm|self_chat> <on|off>"
     )
 
