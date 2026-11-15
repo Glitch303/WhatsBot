@@ -222,10 +222,12 @@ def print_standby_menu(provider, connected):
     # Away status
     import away
     st = away.status()
+    idle = st["idle_seconds"]
+    idle_str = f"{idle // 60}m {idle % 60}s"
     if st["away"]:
-        away_str = c(C.YELLOW, f"AWAY ({st['idle_seconds'] // 60}m idle)")
+        away_str = c(C.YELLOW, f"AWAY ({idle_str} idle)")
     else:
-        away_str = c(C.GREEN, f"present ({st['idle_seconds'] // 60}m idle)")
+        away_str = c(C.GREEN, f"present ({idle_str} idle)")
     print(f"  |  Status:    {away_str}")
 
     print(c(C.BOLD, "  |                                   |"))
