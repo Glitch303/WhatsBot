@@ -100,6 +100,32 @@ def c(color, text):
         return f"{color}{text}{C.RESET}"
     return text
 
+# --- Numbered menu selector ---
+def select_menu(items, title=None):
+    """
+    Interactive menu with numbered choices.
+    items: list of (label, value) tuples or just strings.
+    Returns the value of the selected item, or None if cancelled.
+    """
+    parsed = []
+    for item in items:
+        if isinstance(item, tuple):
+            label, value = item
+        else:
+            label, value = item, item
+        parsed.append((str(label), value))
+
+    total = len(parsed)
+    if title:
+        print(c(C.BOLD, title))
+    for i, (label, _) in enumerate(parsed, 1):
+        print(f"  [{i}] {label}")
+    raw = input(c(C.CYAN, f"  Select (1-{total}, Enter=cancel): ")).strip()
+    _heal_terminal()
+    if raw.isdigit() and 1 <= int(raw) <= total:
+        return parsed[int(raw) - 1][1]
+    return None
+
 # --- Runtime overrides ---
 _runtime = {
     "provider": None,
@@ -458,35 +484,38 @@ def handle_away_mode():
     import away
     print()
     print(c(C.BOLD, "  Away mode:"))
-    print(c(C.DIM, "    [1] auto    = derive from the owner's last activity (default)"))
-    print(c(C.DIM, "    [2] present = force the owner to be present (away mode off)"))
-    print(c(C.DIM, "    [3] away    = force the owner to be away (away mode on)"))
-    while True:
-        raw = input(c(C.CYAN, "  Override (1-3, Enter=current): ")).strip()
-        _heal_terminal()
-        if not raw:
-            return
-        if raw in ("1", away.OVERRIDE_AUTO):
-            away.set_override(away.OVERRIDE_AUTO)
-        elif raw in ("2", away.OVERRIDE_PRESENT):
-            away.set_override(away.OVERRIDE_PRESENT)
-        elif raw in ("3", away.OVERRIDE_AWAY):
-            away.set_override(away.OVERRIDE_AWAY)
-        else:
-            print(c(C.RED, "  Enter 1, 2, 3, auto, present, or away."))
-            continue
-        st = away.status()
-        idle = st["idle_seconds"]
-        idle_txt = f"{idle // 60}m ago" if idle >= 0 else "never"
-        state_txt = "AWAY" if st["away"] else "present"
-        print(c(C.GREEN, f"  Away mode set to {st['override']} (owner {state_txt}, last active {idle_txt})."))
+    print(c(C.DIM, "    auto    = derive from the owner's last activity (default)"))
+    print(c(C.DIM, "    present = force the owner to be present (away mode off)"))
+    print(c(C.DIM, "    away    = force the owner to be away (away mode on)"))
+    sys.stdout.flush()
+    menu_items = [
+        ("auto (default)", away.OVERRIDE_AUTO),
+        ("present (away mode off)", away.OVERRIDE_PRESENT),
+        ("away (away mode on)", away.OVERRIDE_AWAY),
+        ("Cancel", None),
+    ]
+    choice = select_menu(menu_items, title="  Select override:")
+    if choice is None:
         return
+    away.set_override(choice)
+    st = away.status()
+    idle = st["idle_seconds"]
+    idle_txt = f"{idle // 60}m ago" if idle >= 0 else "never"
+    state_txt = "AWAY" if st["away"] else "present"
+    print(c(C.GREEN, f"  Away mode set to {st['override']} (owner {state_txt}, last active {idle_txt})."))
 
 def handle_settings_menu():
     while True:
         print_settings_menu()
-        print_settings_submenu()
-        choice = prompt_choice(5)
+        sys.stdout.flush()
+        menu_items = [
+            ("Toggle DM replies", 1),
+            ("Toggle group @mention", 2),
+            ("Toggle self-chat", 3),
+            ("Set away mode (auto/present/away)", 4),
+            ("Back", 5),
+        ]
+        choice = select_menu(menu_items, title="  Settings:")
         if choice is None:
             return
         if choice == 1:
@@ -707,9 +736,20 @@ def run_menu(connect_fn, start_bot_fn, disconnect_fn, stop_bot_fn):
         clear()
         sys.stdout.flush()
         provider = get_runtime()["provider"]
-        items = print_standby_menu(provider, connected)
+        print_standby_menu(provider, connected)
         sys.stdout.flush()
-        choice = prompt_choice(len(items))
+        # Build menu items for arrow-key selection
+        menu_items = []
+        if connected:
+            menu_items.append(("Disconnect session (stop bot)", 3))
+        else:
+            menu_items.append(("Connect to session", 3))
+        menu_items.append(("Start bot", 4))
+        menu_items.append(("Select model", 1))
+        menu_items.append(("Settings", 2))
+        menu_items.append(("Sessions", 5))
+        menu_items.append(("Quit", 6))
+        choice = select_menu(menu_items, title="  Select an action:")
 
         if choice is None:
             # User typed 'quit' or Ctrl-C
