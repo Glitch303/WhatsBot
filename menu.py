@@ -267,6 +267,7 @@ def print_model_menu():
     for i, p in enumerate(providers, 1):
         marker = c(C.GREEN, "*") if p == (get_runtime()["provider"] or LLM_PROVIDER) else " "
         print(f"    [{i}] {p} {marker}")
+    print(f"    {c(C.DIM, 'Type q to cancel')}")
     print()
 
 def fetch_llamacpp_models(base_url):
