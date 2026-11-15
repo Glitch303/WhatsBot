@@ -92,7 +92,7 @@ _session_note()         — first-ever / new-session context note
 ### `llm.py`
 
 ```
-get_client_and_model()    — provider-specific client (openai/azure/openrouter/llamacpp)
+get_client_and_model()    — provider-specific client (openai/azure/openrouter/llama.cpp)
 call_llm_api()            — unified chat completion (takes a messages list)
 is_owner()                — owner detection (OWNER_NUMBER exact, else pushname)
 build_system_prompt()     — SOUL.md + owner/group note + session note + memory blocks

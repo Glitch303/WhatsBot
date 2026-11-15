@@ -40,7 +40,7 @@ def get_client_and_model():
     """
     Returns an LLM client configured for the chosen provider.
     Uses the OpenAI Python SDK interface for all providers.
-    Supported: "openai", "azure", "openrouter", "llamacpp"
+    Supported: "openai", "azure", "openrouter", "llama.cpp"
 
     Runtime overrides from the menu (menu._runtime) take precedence over .env.
     """
@@ -78,13 +78,13 @@ def get_client_and_model():
             ),
             model,
         )
-    elif provider == "llamacpp":
+    elif provider == "llama.cpp":
         base_url = override_base_url or LLAMACPP_BASE_URL
         model = override_model or LLAMACPP_MODEL
-        api_key = LLAMACPP_API_KEY or "llamacpp"  # "llamacpp" = no-auth servers
+        api_key = LLAMACPP_API_KEY or "llama.cpp"  # "llama.cpp" = no-auth servers
         return OpenAI(base_url=base_url, api_key=api_key), model
     else:
-        raise ValueError(f"Unsupported LLM provider: {provider!r}. Expected one of: openai, azure, openrouter, llamacpp")
+        raise ValueError(f"Unsupported LLM provider: {provider!r}. Expected one of: openai, azure, openrouter, llama.cpp")
 
 
 def call_llm_api(messages: list) -> str:

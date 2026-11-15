@@ -16,7 +16,7 @@ Copy `example.env` to `.env` and edit. All variables are read once at startup vi
 | `OWNER_NAME` | ❌ | `Owner` | The owner's name. Injected into the system prompt so the persona knows who gets the private face. |
 | `OWNER_NUMBER` | ❌ | — (pushname match) | Owner's phone number (international format, no `+`). When set, the owner is matched by exact phone; when unset, by pushname. |
 | `REPLY_WHITELIST` | ❌ | `*` | Comma-separated phone numbers that get AI responses. `*` = everyone. Example: `6285712345678,6281234567890` |
-| `LLM_PROVIDER` | ✅ | — | One of: `openai`, `azure`, `openrouter`, `llamacpp` |
+| `LLM_PROVIDER` | ✅ | — | One of: `openai`, `azure`, `openrouter`, `llama.cpp` |
 
 > **Persona:** the bot's character is not configured via env — it lives in `SOUL.md` (see [File Paths](#file-paths)). Copy `SOUL.example.md` to `SOUL.md` and edit. The file is re-read on every message, so edits apply live.
 
@@ -98,9 +98,9 @@ The model picker in the terminal menu sets runtime overrides that take precedenc
 
 | Override | Source | Description |
 |----------|--------|-------------|
-| `provider` | Menu → Select model | `openai`, `azure`, `openrouter`, `llamacpp` |
+| `provider` | Menu → Select model | `openai`, `azure`, `openrouter`, `llama.cpp` |
 | `model` | Menu → Select model | Model name/deployment |
-| `base_url` | Menu → Select model | For `llamacpp`: server URL; for `azure`: endpoint |
+| `base_url` | Menu → Select model | For `llama.cpp`: server URL; for `azure`: endpoint |
 
 For `azure`, the menu also sets `AZURE_DEPLOYMENT_NAME`, `AZURE_ENDPOINT`, and `AZURE_SUBSCRIPTION_KEY` in `os.environ` so the config module picks them up.
 

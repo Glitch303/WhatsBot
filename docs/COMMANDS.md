@@ -474,11 +474,11 @@ Toggle: !replies <group_mention|dm|self_chat> <on|off>
 
 | Input | Action |
 |-------|--------|
-| `1`–`4` | Select provider (openai, azure, openrouter, llamacpp) |
+| `1`–`4` | Select provider (openai, azure, openrouter, llama.cpp) |
 | `Enter` | Keep current provider |
 | `q` / `quit` | Cancel |
 
-After selecting a provider, you're prompted for model details (varies by provider). For `llamacpp`, a model list is fetched from the server.
+After selecting a provider, you're prompted for model details (varies by provider). For `llama.cpp`, a model list is fetched from the server.
 
 ### Settings submenu
 

@@ -2,7 +2,7 @@
 Standby menu for WhatsBot.
 
 Flow:
-   1. Select model (openai / azure / openrouter / llamacpp)
+   1. Select model (openai / azure / openrouter / llama.cpp)
    2. Settings (toggle dm, group_mention, self_chat, view context/memory)
    3. Connect to session (QR scan) -- establishes the WhatsApp login so the
       session shows "CONNECTED". Does NOT start the bot; the bot stays in
@@ -185,17 +185,17 @@ def print_banner():
 
 def print_standby_menu(provider, connected):
     print()
-    print(c(C.BOLD, "  +----------- WHATSBOT -----------+"))
-    print(c(C.BOLD, "  |                                |"))
+    print(c(C.BOLD, "  +------------- WHATSBOT ------------+"))
+    print(c(C.BOLD, "                                       "))
 
     # Model status
     from config import LLM_PROVIDER, LLAMACPP_BASE_URL
     from llm import get_client_and_model
     try:
         _, model = get_client_and_model()
-        model_str = f"{provider or LLM_PROVIDER} / {model}"
+        model_str = f"{provider or LLM_PROVIDER}/{model}"
         active_prov = provider or LLM_PROVIDER
-        if active_prov == "llamacpp":
+        if active_prov == "llama.cpp":
             models = fetch_llamacpp_models(LLAMACPP_BASE_URL)
             if models:
                 for m in models:
@@ -206,18 +206,18 @@ def print_standby_menu(provider, connected):
                     model_str += " " + c(C.YELLOW, "(not loaded)")
     except Exception as e:
         model_str = c(C.RED, f"error: {e}")
-    print(f"  |  Model:     {model_str}")
+    print(f"    Model:     {model_str}")
 
     # Feature toggles
     from bot_settings import get_settings
     s = get_settings()
-    print(f"  |  DM:        {'ON' if s['dm'] else 'off'}")
-    print(f"  |  Group @:   {'ON' if s['group_mention'] else 'off'}")
-    print(f"  |  Self-chat: {'ON' if s['self_chat'] else 'off'}")
+    print(f"    DM:        {'ON' if s['dm'] else 'off'}")
+    print(f"    Group @:   {'ON' if s['group_mention'] else 'off'}")
+    print(f"    Self-chat: {'ON' if s['self_chat'] else 'off'}")
 
     # Connection status -- prominently shown in standby menu
     conn = c(C.GREEN, "CONNECTED") if connected else c(C.YELLOW, "not connected")
-    print(f"  |  Session:   {conn}")
+    print(f"    Session:   {conn}")
 
     # Away status
     import away
@@ -228,9 +228,9 @@ def print_standby_menu(provider, connected):
         away_str = c(C.YELLOW, f"AWAY ({idle_str} idle)")
     else:
         away_str = c(C.GREEN, f"present ({idle_str} idle)")
-    print(f"  |  Status:    {away_str}")
+    print(f"    Status:    {away_str}")
 
-    print(c(C.BOLD, "  |                                   |"))
+    print(c(C.BOLD, "                                       "))
     print(c(C.BOLD, "  +-----------------------------------+"))
     print()
 
@@ -298,7 +298,7 @@ def prompt_choice(max_num):
 
 def print_model_menu():
     from config import LLM_PROVIDER
-    providers = ["openai", "azure", "openrouter", "llamacpp"]
+    providers = ["openai", "azure", "openrouter", "llama.cpp"]
     print()
     print(c(C.BOLD, "  Select LLM provider:"))
     for i, p in enumerate(providers, 1):
@@ -385,7 +385,7 @@ def prompt_llamacpp_model(models, default_model):
 
 def prompt_model_choice():
     from config import LLM_PROVIDER, LLAMACPP_BASE_URL, LLAMACPP_MODEL
-    providers = ["openai", "azure", "openrouter", "llamacpp"]
+    providers = ["openai", "azure", "openrouter", "llama.cpp"]
     while True:
         raw = input(c(C.BOLD, "  Provider (1-4, Enter=current): ")).strip()
         _heal_terminal()
@@ -418,7 +418,7 @@ def prompt_model_choice():
                 _heal_terminal()
                 set_runtime("model", model)
                 set_runtime("base_url", None)
-            elif choice == "llamacpp":
+            elif choice == "llama.cpp":
                 url = LLAMACPP_BASE_URL
                 set_runtime("base_url", url)
 

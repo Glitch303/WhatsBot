@@ -15,7 +15,7 @@ Usage:
     whatsbot toggle self      Toggle self-chat
     whatsbot away auto|on|off Set away override
     whatsbot away-status      Show away status
-    whatsbot model provider X Set LLM provider (openai/azure/openrouter/llamacpp)
+    whatsbot model provider X Set LLM provider (openai/azure/openrouter/llama.cpp)
     whatsbot model name X     Set LLM model
 """
 

@@ -10,7 +10,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 CONV_DB_PATH = str(_PROJECT_ROOT / "db" / "conversations.sqlite3")
 NEO_DB_PATH = str(_PROJECT_ROOT / "db" / "neonize.sqlite3")
 
-# "openai" or "azure" or "openrouter" or "llamacpp"
+# "openai" or "azure" or "openrouter" or "llama.cpp"
 LLM_PROVIDER = os.getenv("LLM_PROVIDER")
 
 # Azure configuration

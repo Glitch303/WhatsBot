@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
 # WhatsBot CLI wrapper
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve symlinks to find the real script location
+REALPATH="$(readlink -f "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$REALPATH")" && pwd)"
 exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/whatsbot.py" "$@"

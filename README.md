@@ -168,7 +168,7 @@ The first time you run it, the menu will show a QR code. Scan it with WhatsApp �
 llama-swap -port 8080 -m ./models
 
 # In .env:
-LLM_PROVIDER=llamacpp
+LLM_PROVIDER=llama.cpp
 LLAMACPP_BASE_URL=http://localhost:8080/v1
 LLAMACPP_MODEL=Gemma4
 ```
@@ -187,7 +187,7 @@ All configuration lives in `.env`. See [docs/CONFIGURATION.md](docs/CONFIGURATIO
 | `OWNER_NAME` | `Owner` | The owner's name (used for the public/private face) |
 | `OWNER_NUMBER` | — (name match) | Owner's phone number (exact match; falls back to pushname) |
 | `REPLY_WHITELIST` | `*` | Phone numbers that get AI responses (`*` = everyone) |
-| `LLM_PROVIDER` | — | `openai` \| `azure` \| `openrouter` \| `llamacpp` |
+| `LLM_PROVIDER` | — | `openai` \| `azure` \| `openrouter` \| `llama.cpp` |
 | `SESSION_GAP_SECONDS` | `3600` | Silence gap (seconds) before a session is reported as "new" |
 | `VERBATIM_TURNS` | `10` | How many recent user turns kept verbatim in context |
 | `MEMORY_CUTOFF_DAYS` | `30` | Prune messages older than this |
@@ -202,7 +202,7 @@ All configuration lives in `.env`. See [docs/CONFIGURATION.md](docs/CONFIGURATIO
 | `openai` | `OPENAI_API_KEY`, `OPENAI_MODEL` | Standard OpenAI API |
 | `azure` | `AZURE_ENDPOINT`, `AZURE_DEPLOYMENT_NAME`, `AZURE_SUBSCRIPTION_KEY`, `AZURE_API_VERSION` | Azure OpenAI Service |
 | `openrouter` | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` | OpenRouter gateway |
-| `llamacpp` | `LLAMACPP_BASE_URL`, `LLAMACPP_MODEL` | Local llama.cpp / llama-swap (OpenAI-compatible) |
+| `llama.cpp` | `LLAMACPP_BASE_URL`, `LLAMACPP_MODEL` | Local llama.cpp / llama-swap (OpenAI-compatible) |
 
 ---
 
@@ -244,7 +244,7 @@ Running `python main.py` opens a terminal menu:
 ```
   ┌─────────── WHATSBOT ───────────┐
   │                                │
-  │  Model:     llamacpp / Qwen... │
+  │  Model:     llama.cpp / Qwen...│
   │  DM:        ON                 │
   │  Group @:   off                │
   │  Self-chat: ON                 │
@@ -264,7 +264,7 @@ Running `python main.py` opens a terminal menu:
 
 | # | Action | Description |
 |---|--------|-------------|
-| 1 | **Select model** | Switch LLM provider and model at runtime. For `llamacpp`, fetches the model list from the server. |
+| 1 | **Select model** | Switch LLM provider and model at runtime. For `llama.cpp`, fetches the model list from the server. |
 | 2 | **Settings** | Toggle DM / group mode / self-chat replies. View session/memory settings. |
 | 3 | **Connect / Disconnect** | Connect = QR-scan to log in (session shows "CONNECTED"). Disconnect = stop bot + drop session. |
 | 4 | **Start bot** | Activate the bot and enter the live log view. Session stays connected. |
@@ -360,7 +360,7 @@ For deeper technical detail, see:
 
 ### LLM errors
 - Check `app.log` for "Error calling LLM API". Common causes: model not loaded, server unreachable, API key invalid.
-- For `llamacpp`, verify the server is running: `curl http://localhost:8080/v1/models`.
+- For `llama.cpp`, verify the server is running: `curl http://localhost:8080/v1/models`.
 
 ### Messages from history sync
 - On first connect, Whatsmeow syncs conversation history. These are backfilled into sessions but **not** processed for replies (only real-time messages are).
