@@ -1,6 +1,8 @@
+import argparse
 import logging
 import os
 import threading
+import time
 
 def configure_logging():
     logger = logging.getLogger()
@@ -14,6 +16,10 @@ def configure_logging():
     logger.addHandler(file_handler)
 
 def main():
+    parser = argparse.ArgumentParser(description="WhatsBot")
+    parser.add_argument("--headless", action="store_true", help="Run as headless service (no menu)")
+    args = parser.parse_args()
+
     configure_logging()
 
     from neonize.utils import log
@@ -25,8 +31,13 @@ def main():
 
     from database import init_db
     from config import CONV_DB_PATH, NEO_DB_PATH
-    from whatsapp import on_history_sync, on_message, start_cleanup_thread, set_bot_running
-    from menu import run_menu
+    from whatsapp import on_history_sync, on_message, start_cleanup_thread, set_bot_running, is_bot_running
+    from menu import run_menu, get_runtime, set_runtime
+
+    if args.headless:
+        from control_server import start_control_server, stop_control_server, SOCKET_PATH
+        import away
+        import bot_settings
 
     # --- Setup ---
     os.makedirs(os.path.dirname(CONV_DB_PATH), exist_ok=True)
@@ -141,14 +152,76 @@ def main():
         logging.info("Bot stopped (session stays connected)")
         state["connected"] = True  # session remains connected
 
-    # --- Run the menu loop ---
-    try:
-        run_menu(connect_fn, start_bot_fn, disconnect_fn, stop_bot_fn)
-    except KeyboardInterrupt:
-        logging.info("Interrupted.")
-    finally:
-        disconnect_fn()
-        logging.info("Exited.")
+    # --- Headless mode: start control server, auto-connect, auto-start ---
+    if args.headless:
+        # Status getter for control server
+        def get_status():
+            import bot_settings
+            st = away.status()
+            return {
+                "connected": state["connected"],
+                "running": is_bot_running,
+                "away": st["away"],
+                "away_override": st["override"],
+                "away_idle_seconds": st["idle_seconds"],
+                "settings": bot_settings.get_settings(),
+                "runtime": get_runtime(),
+            }
+
+        # Wire up callbacks for control server
+        callbacks = {
+            "connect": connect_fn,
+            "disconnect": disconnect_fn,
+            "start": start_bot_fn,
+            "stop": stop_bot_fn,
+            "status": get_status,
+            "toggle": lambda key, value=None: bot_settings.toggle(key, value),
+            "get_setting": lambda key: bot_settings.get_settings().get(key, False),
+            "away": lambda state_val: (away.set_override(state_val), away.status())[1],
+            "away_status": away.status,
+            "model_provider": lambda p: set_runtime("provider", p),
+            "model_name": lambda m: set_runtime("model", m),
+            "quit": stop_bot_fn,
+        }
+
+        # Start control server
+        logging.info("Starting headless service...")
+        control = start_control_server(SOCKET_PATH, callbacks)
+
+        # Install log stream handler (pushes logs to connected CLI clients)
+        class HeadlessLogStream(logging.Handler):
+            def emit(self, record):
+                try:
+                    control.broadcast_log(record)
+                except Exception:
+                    pass
+        headless_log = HeadlessLogStream()
+        headless_log.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+        logging.getLogger().addHandler(headless_log)
+
+        # Auto-connect
+        if connect_fn():
+            logging.info("Connected (headless)")
+            # Auto-start bot
+            start_bot_fn()
+            logging.info("Bot started (headless)")
+            # Wait forever (until killed)
+            while True:
+                time.sleep(60)
+        else:
+            logging.warning("Connection failed (headless) — waiting for reconnect")
+
+        # Shutdown
+        control.shutdown()
+    else:
+        # --- Run the menu loop ---
+        try:
+            run_menu(connect_fn, start_bot_fn, disconnect_fn, stop_bot_fn)
+        except KeyboardInterrupt:
+            logging.info("Interrupted.")
+        finally:
+            disconnect_fn()
+            logging.info("Exited.")
     # Hard exit -- the neonize event loop thread may not fully stop
     os._exit(0)
 

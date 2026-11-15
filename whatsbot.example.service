@@ -1,0 +1,19 @@
+# Public template — copy to whatsbot.service (local, gitignored) and replace
+# the path/to/ prefixes with your actual install path.
+# If your install path contains spaces, quote the ExecStart paths.
+[Unit]
+Description=WhatsBot - Headless WhatsApp bot service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=path/to/WhatsBot/.venv/bin/python path/to/WhatsBot/main.py --headless
+WorkingDirectory=path/to/WhatsBot
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=HOME=path/to/home
+
+[Install]
+WantedBy=default.target
