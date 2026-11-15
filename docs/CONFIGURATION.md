@@ -63,6 +63,21 @@ Copy `example.env` to `.env` and edit. All variables are read once at startup vi
 | `MAX_FACTS_IN_CONTEXT` | ❌ | `8` | Max number of facts injected into the system prompt. |
 | `MAX_REPLY_TOKENS` | ❌ | `500` | Hard token cap per LLM reply (passed to the API). |
 
+### Away Mode
+
+The bot steps in as the owner's proxy when the owner is inactive. The owner is
+considered "away" once they have not been active for `AWAY_AFTER_MINUTES`.
+Activity is detected from the owner's own messages (matched by `OWNER_NUMBER`
+or pushname) and from the self-chat. The state can be overridden at runtime via
+the menu (Settings → Set away mode) or `!away [on|off|auto]` (`auto` = derive
+from timing, `present` = force present, `away` = force away).
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `AWAY_AFTER_MINUTES` | ❌ | `30` | Minutes of owner inactivity before the owner counts as "away". |
+| `SIGNATURE_NAME` | ❌ | `Yuki` | Persona name appended to DM / self-chat replies (e.g. "(Yuki)"). |
+| `SIGNATURE_ENABLED` | ❌ | `true` | Append the signature to non-group replies. Set `false` to disable. |
+
 ---
 
 ## Runtime Settings (`bot_settings.py`)
@@ -144,4 +159,9 @@ LLAMACPP_MODEL=Qwen3.8-Orca-27B-Instruct
 # FACT_CUTOFF_DAYS=60
 # MAX_FACTS_IN_CONTEXT=8
 # MAX_REPLY_TOKENS=500
+
+# --- Away Mode (optional) ---
+# AWAY_AFTER_MINUTES=30
+# SIGNATURE_NAME=Yuki
+# SIGNATURE_ENABLED=true
 ```

@@ -23,6 +23,7 @@ List all available commands.
 !files - List files in the downloads folder
 !removefile <ID or filename> - Remove a file from the downloads folder
 !renamebot <new_name> - Change the bot's name
+!away [on|off|auto] - Show/set away mode (bot replies as your proxy when you're away)
 !new - Start a new session (previous one stays saved, resumable)
 !title [name] - Set/show the title of the current session
 !sessions [search] - List sessions for this chat (optionally search)
@@ -92,6 +93,32 @@ Change the bot's display name (sent to the current chat).
 ```
 !renamebot Yuki
 ```
+
+---
+
+### `!away [on|off|auto]`
+
+Show or set the away-mode override. Away mode makes the bot step in as your
+proxy when you've been inactive for `AWAY_AFTER_MINUTES` (default 30): it tells
+the person you're away (in its own words) and keeps chatting on your behalf.
+
+- `!away` or `!away auto` — show status, use the automatic timing (default).
+- `!away on` — force the owner to be away (away mode on).
+- `!away off` — force the owner to be present (away mode off).
+
+```
+!away
+!away on
+```
+
+**Response:**
+```
+[COMMAND] Away mode: auto (owner present, last active 2m ago, threshold 30m).
+```
+
+The owner also becomes "present" automatically the moment they send any message
+(their own activity resets the timer). The same override is available from the
+terminal menu (Settings → Set away mode).
 
 ---
 
@@ -460,7 +487,11 @@ After selecting a provider, you're prompted for model details (varies by provide
 | `1` | Toggle DM replies |
 | `2` | Toggle group @mention |
 | `3` | Toggle self-chat |
-| `4` | Back to main menu |
+| `4` | Set away mode (auto / present / away) |
+| `5` | Back to main menu |
+
+The settings screen also shows the current away-mode state (present/away, the
+active override, how long since the owner was last active, and the threshold).
 
 ### Sessions view
 
@@ -489,18 +520,19 @@ Commands are checked in this order inside `handle_commands()`:
 3. `!removefile` — 2-5s random delay
 4. `!commands` — 2-5s random delay
 5. `!renamebot` — 2-5s random delay
-6. `!new` — 2-5s random delay
-7. `!title` — 2-5s random delay
-8. `!sessions` — 2-5s random delay
-9. `!resume` — 2-5s random delay
-10. `!delete` — 2-5s random delay
-11. `!memory` — 2-5s random delay
-12. `!facts` — 2-5s random delay
-13. `!forget` — 2-5s random delay
-14. `!stats` — 2-5s random delay
-15. `!reset` — 2-5s random delay
-16. `!pause` — 2-5s random delay
-17. `!permanentstop` — 2-5s random delay
-18. Any other `!...` — 2-5s random delay + "Unknown command"
+6. `!away` — 2-5s random delay
+7. `!new` — 2-5s random delay
+8. `!title` — 2-5s random delay
+9. `!sessions` — 2-5s random delay
+10. `!resume` — 2-5s random delay
+11. `!delete` — 2-5s random delay
+12. `!memory` — 2-5s random delay
+13. `!facts` — 2-5s random delay
+14. `!forget` — 2-5s random delay
+15. `!stats` — 2-5s random delay
+16. `!reset` — 2-5s random delay
+17. `!pause` — 2-5s random delay
+18. `!permanentstop` — 2-5s random delay
+19. Any other `!...` — 2-5s random delay + "Unknown command"
 
 > The random delay makes command responses feel less robotic. Reply-toggle commands (`!replies`, `!status`) skip the delay since they're control commands.

@@ -42,9 +42,10 @@ WhatsBot/
 ├── menu.py               — terminal menu + live view
 ├── whatsapp.py           — message pipeline
 ├── llm.py                — LLM calls + conversation assembly
-├── sessionstore.py       — session store (SQLite, persistent conn)
+├── sessionstore.py       — session store (SQLite, persistent conn) + bot_state
 ├── database.py           — facts table (per-user durable facts)
 ├── prompts.py            — prompt scaffolding (group note, summary, facts)
+├── away.py               — away mode (owner-activity tracking + override)
 ├── config.py             — env vars + SOUL.md loader
 ├── bot_settings.py       — runtime reply toggles (dm, group, self_chat)
 ├── SOUL.md               — the persona (gitignored, re-read every message)
@@ -77,10 +78,10 @@ WhatsBot/
 ```
 on_message()            — main pipeline (see Message Flow below)
 on_history_sync()       — backfills synced messages into sessions
-handle_commands()       — !new, !title, !sessions, !resume, !delete, !reset, ...
+handle_commands()       — !new, !title, !sessions, !resume, !delete, !away, !reset, ...
 handle_reply_commands() — !replies, !status (no delay)
 handle_file()           — PDF/DOCX/TXT ingestion → converted/*.txt
-handle_final_response() — LLM call + send + store assistant reply
+handle_final_response() — LLM call + send + store assistant reply (away-aware)
 resolve_sender_phone()  — LID → phone (cached)
 is_self_chat()          — self-chat detection
 is_bot_mentioned()      — group @mention check
@@ -123,6 +124,30 @@ stats()                   — totals + current binding per chat (menu view)
 
 Module-level `store = SessionStore(CONV_DB_PATH)` — created at import (imported by `whatsapp.py`/`menu.py`), so migration runs at startup before any message.
 
+### `away.py`
+
+Away mode: the bot steps in as the owner's proxy when the owner is inactive. Owner activity is tracked in the store's `bot_state` table (survives restarts).
+
+```
+mark_owner_active(ts)   — record owner activity (their messages / self-chat); clears the announce flag
+is_away()               — override wins (present/away), else idle > AWAY_AFTER_MINUTES
+set_override(state)     — auto | present | away (menu / !away); leaving "away" clears the flag
+status()                — {override, away, idle_seconds, threshold_minutes}
+away_context(sid, ann)  — system-prompt note: announce (first reply) vs keep-chatting (later)
+away_announced(sid)     — was the away notice already sent in this session?
+mark_away_announced(sid)— set after a successful away reply (per session)
+clear_away_announced()  — forget all per-session flags (owner active / away ended)
+```
+
+On first run the owner is assumed present; on later restarts the persisted
+timestamp is used. The owner becomes "present" the moment they send any message.
+
+The away notice is sent **once per session**: the first reply after the owner
+goes away announces it (LLM-crafted, not hardcoded); later replies in the same
+session use a softer note so the bot keeps chatting without repeating "the
+owner is away". The flag resets when the owner comes back, when the override
+leaves "away", or in a new session (`!new`).
+
 ### `database.py`
 
 Facts table only (per-user durable facts): `save_fact`, `get_facts`, `delete_fact`, `get_fact_count`, `prune_stale_facts`, `init_db`.
@@ -164,6 +189,9 @@ whatsapp.on_message(client, message)
 │
 │     is_self = is_self_chat(chat, sender_id)
 │     if not is_self and phone matches: is_self = True  (fallback)
+│
+│     if is_self or is_owner(sender_phone, sender_name):
+│         away.mark_owner_active(timestamp)   # resets the "away" timer
 │
 ├── 3. FILTER
 │     if is_edit or is_viewonce: return
@@ -236,10 +264,13 @@ whatsapp.on_message(client, message)
 │     handle_final_response(...)
 │           ├── 2-5s random delay
 │           ├── owner = is_self or is_owner(sender_id, sender_name)
-│           ├── generate_final_response(store, session_id, ...)
+│           ├── is_away = (not is_group) and (not is_self) and away.is_away()
+│           ├── generate_final_response(store, session_id, ..., is_away=is_away)
 │           │     └── build_convo()
 │           │           ├── load_soul()          ← SOUL.md (fresh read)
 │           │           ├── owner/group note
+│           │           ├── [Owner is away]      ← only when is_away; announce once
+│           │           │                           per session, then keep-chatting
 │           │           ├── session_note
 │           │           ├── [FACTS about this user]
 │           │           ├── [CONVERSATION SUMMARY]
@@ -247,6 +278,7 @@ whatsapp.on_message(client, message)
 │           │           ├── store.history()      ← verbatim tail
 │           │           └── current user turn
 │           │     └── call_llm_api()
+│           │     └── append "({SIGNATURE_NAME})" (non-group, if enabled)
 │           ├── send_message(...)
 │           ├── presence PAUSED
 │           └── store.append(session_id, ("assistant", reply))
@@ -337,6 +369,7 @@ LOG CONSUMER THREAD (daemon, only during live view)
 | `chat_sessions` | Active session binding per chat | `session_key` |
 | `summaries` | Rolling summary per session | `session_id` |
 | `facts` | Durable extracted facts per user | `id` (INTEGER) |
+| `bot_state` | Away-mode bookkeeping (`owner_last_active`, `away_override`) | `key` |
 
 ---
 

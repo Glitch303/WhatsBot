@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS summaries (
     summary_text TEXT NOT NULL,
     last_summarized_timestamp REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS bot_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -131,6 +136,33 @@ class SessionStore:
     def close(self):
         with self._lock:
             self._conn.close()
+
+    # ---- bot state (small key/value, e.g. away-mode bookkeeping) --------------
+
+    def get_state(self, key: str, default: str = "") -> str:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM bot_state WHERE key = ?", (key,)
+            ).fetchone()
+            return row["value"] if row else default
+
+    def set_state(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO bot_state (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            self._conn.commit()
+
+    def delete_state_prefix(self, prefix: str) -> int:
+        """Delete all bot_state keys starting with ``prefix``; return rowcount."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM bot_state WHERE key LIKE ?", (prefix + "%",)
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     # ---- migrations -----------------------------------------------------------
 

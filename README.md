@@ -40,6 +40,7 @@ Built on top of [Neonize](https://github.com/krypton-byte/neonize) (a Python wra
 | **Fact Extraction** | Durable facts (names, preferences, plans, etc.) are extracted from messages and injected into future context. |
 | **File Ingestion** | Send PDF, DOCX, or TXT files from an admin number — content is extracted and used as context for all subsequent responses. |
 | **Session Awareness** | Detects when a user returns after a long gap and tells the LLM about it ("new session, last conversation was 3 hours ago"). |
+| **Away Mode** | When the owner goes quiet for `AWAY_AFTER_MINUTES`, the bot steps in as their proxy — the LLM naturally lets people know the owner is away and keeps chatting. Override via `!away [on\|off\|auto]` or the menu. Replies are signed with the persona name (e.g. `- Yuki`). |
 | **Rate Limiting** | Max 5 responses per user per 30-second window. |
 | **Background Cleanup** | A daemon thread prunes old messages and stale facts every 6 hours. |
 
@@ -70,6 +71,9 @@ Incoming WhatsApp message
          │     ├─ self:   reply if self_chat toggle ON (default)
          │     └─ DM:     reply if dm toggle ON (default)
          │
+         ├─ If the sender is the owner (or self-chat): mark owner active
+         │     (resets the away-mode timer)
+         │
          ├─ Skip if older than 60s, or if bot is paused (except self-chat)
          │
          ├─ Mark as read
@@ -87,12 +91,16 @@ Incoming WhatsApp message
          │
          └─ handle_final_response()
                │
+               ├─ If the owner is away (DM/self-chat only): add an
+               │     "owner is away" note so the LLM crafts the first message
+               │
                ├─ Build conversation:
                │     SOUL.md + owner/group note + session note
                │     + [FACTS] + [CONVERSATION SUMMARY] + [ADDITIONAL CONTENT]
                │     + verbatim history tail + current turn
                │
-               └─ LLM call → send reply → store assistant message
+               └─ LLM call → append "({SIGNATURE_NAME})" (non-group)
+                          → send reply → store assistant message
 ```
 
 ### Memory Model
@@ -208,6 +216,7 @@ Send these from your admin number (configured in `ADMIN_NUMBERS`):
 | `!files` | List uploaded files |
 | `!removefile <ID or name>` | Remove a file |
 | `!renamebot <name>` | Change the bot's name |
+| `!away [on\|off\|auto]` | Show/set away mode (`auto` = derive from owner activity) |
 | `!new` | Start a new session (previous one stays saved, resumable) |
 | `!title [name]` | Set/show the title of the current session |
 | `!sessions [search]` | List sessions for this chat (optionally search) |
@@ -295,6 +304,7 @@ WhatsBot/
 ├── whatsapp.py          # Message handler: on_message, commands, files, LID resolution
 ├── bot_settings.py      # Thread-safe runtime settings (dm, group_mention, self_chat)
 ├── sessionstore.py      # Session store: sessions, messages, summaries (persistent SQLite)
+├── away.py              # Away mode: owner-activity tracking + override
 ├── database.py          # SQLite: facts table (per-user durable facts)
 ├── llm.py               # LLM client, conversation assembly, summary, fact extraction
 ├── prompts.py           # Prompt scaffolding (group note, summary, fact prompts)
@@ -354,6 +364,12 @@ For deeper technical detail, see:
 
 ### Messages from history sync
 - On first connect, Whatsmeow syncs conversation history. These are backfilled into sessions but **not** processed for replies (only real-time messages are).
+
+### Away mode not triggering (or triggering too early)
+- The owner is "away" when they have not sent any message for `AWAY_AFTER_MINUTES` (default 30). Owner activity = their own messages (matched by `OWNER_NUMBER` or pushname) + self-chat.
+- `!away` shows the current state and lets you force it: `!away on` (force away), `!away off` (force present), `!away auto` (derive from timing). The menu (Settings → Set away mode) does the same.
+- The away message is LLM-generated (not hardcoded). It is only pushed on the **first reply of each session** after the owner goes away; later replies keep chatting without repeating "the owner is away". It re-announces when the owner comes back and goes away again, or in a new session (`!new`). Adjust the wording in `away.py:away_context()`.
+- The `({SIGNATURE_NAME})` signature is only added to DM / self-chat replies (never groups) and only when `SIGNATURE_ENABLED=true`.
 
 ---
 

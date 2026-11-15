@@ -13,6 +13,7 @@ from neonize.utils import log
 from neonize.utils.enum import ChatPresence, ChatPresenceMedia, ReceiptType
 from neonize.utils.jid import Jid2String
 
+import away
 from config import ADMIN_NUMBERS, REPLY_WHITELIST, SESSION_GAP_SECONDS, VERBATIM_TURNS, norm_phone
 from bot_settings import get_settings, toggle as toggle_setting, status_text
 from database import get_facts, delete_fact, get_fact_count, prune_stale_facts
@@ -394,6 +395,7 @@ def handle_commands(client: NewClient, chat, sender_id, sender_name, text: str,
                     "!files - List files in the downloads folder",
                     "!removefile <ID or filename> - Remove a file from the downloads folder",
                     "!renamebot <new_name> - Change the bot's name",
+                    "!away [on|off|auto] - Show/set away mode (bot replies as your proxy when you're away)",
                     "!new - Start a new session (the current one stays saved)",
                     "!title [name] - Show or set the current session title",
                     "!sessions [search] - List sessions for this chat (or search them)",
@@ -422,6 +424,26 @@ def handle_commands(client: NewClient, chat, sender_id, sender_name, text: str,
             return True
         client.send_message(chat, f"[COMMAND] Bot name updated: {new_bot_name}.")
         log.info(f"Processed !renamebot command for {sender_id}. New name: {new_bot_name}")
+        return True
+    elif text.startswith("!away"):
+        parts = text.split(" ", 1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+        if arg in ("on", "away"):
+            away.set_override(away.OVERRIDE_AWAY)
+            client.send_message(chat, "[COMMAND] Away mode forced ON (the bot replies as your proxy until you send a message or set it back to auto).")
+        elif arg in ("off", "present"):
+            away.set_override(away.OVERRIDE_PRESENT)
+            client.send_message(chat, "[COMMAND] Away mode forced OFF (the bot will not step in as your proxy).")
+        elif arg in ("auto", ""):
+            away.set_override(away.OVERRIDE_AUTO)
+            st = away.status()
+            idle = st["idle_seconds"]
+            idle_txt = f"{idle // 60}m" if idle >= 0 else "never"
+            state_txt = "AWAY" if st["away"] else "present"
+            client.send_message(chat, f"[COMMAND] Away mode: auto (owner {state_txt}, last active {idle_txt} ago, threshold {st['threshold_minutes']}m).")
+        else:
+            client.send_message(chat, "[COMMAND] Usage: !away [on|off|auto]")
+        log.info(f"Processed !away command for {sender_id}.")
         return True
     elif text.startswith("!new"):
         had = store.current_session(key) is not None
@@ -584,9 +606,14 @@ def handle_final_response(client: NewClient, chat, sender_id, sender_name, text,
     start_time = time.time()
 
     owner = is_self or is_owner_sender(sender_id, sender_name)
+    # Away mode: the bot steps in as the owner's proxy for DMs when the owner
+    # has been inactive. Groups use the @mention mechanism instead.
+    is_away = (not is_group) and (not is_self) and away.is_away()
+    if is_away:
+        log.info(f"Owner is away (idle {away.idle_seconds()}s); responding as proxy for {sender_id}.")
     final_answer = generate_final_response(
         store, session_id, sender_id, text, sender_name,
-        is_group, owner, session_note,
+        is_group, owner, session_note, is_away=is_away,
     )
     log.debug(f"Final answer generated: {final_answer}")
     if not final_answer or not final_answer.strip():
@@ -751,6 +778,11 @@ def on_message(client: NewClient, message: MessageEv):
             if sender_phone == self_phone:
                 is_self = True
                 log.info(f"Self-chat matched by phone: {sender_phone}")
+
+        # Away mode: record the owner's activity (their own messages / self-chat).
+        # Any message the owner sends resets the "away" timer.
+        if is_self or is_owner_sender(sender_phone or sender_id, sender_name):
+            away.mark_owner_active(timestamp)
 
         # Note: in whatsmeow's event stream IsFromMe is true for ALL inbound
         # messages (both others' DMs and your own self-chat), so it cannot be

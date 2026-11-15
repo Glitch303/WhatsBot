@@ -68,6 +68,16 @@ MAX_FACTS_IN_CONTEXT = int(os.getenv("MAX_FACTS_IN_CONTEXT", "8"))
 # LLM reply limits
 MAX_REPLY_TOKENS = int(os.getenv("MAX_REPLY_TOKENS", "500"))  # hard token cap per reply
 
+# Away mode: the bot steps in as the owner's proxy when the owner is inactive.
+# The owner is considered "away" once they have not been active for this many
+# minutes (env-adjustable). Override via the menu or !away (auto|present|away).
+AWAY_AFTER_MINUTES = int(os.getenv("AWAY_AFTER_MINUTES", "30"))
+
+# Signature: the persona name appended to the end of the bot's replies
+# (e.g. "(Yuki)"). Applied to DM / self-chat replies (not groups).
+SIGNATURE_NAME = os.getenv("SIGNATURE_NAME", "Yuki")
+SIGNATURE_ENABLED = os.getenv("SIGNATURE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+
 def norm_phone(num: str) -> str:
     """Normalize a phone number for comparison: strip +, @, :N device suffix, whitespace."""
     return (num or "").strip().lstrip("+").replace("@", "").split(":", 1)[0]

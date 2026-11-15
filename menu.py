@@ -399,6 +399,7 @@ def prompt_model_choice():
             print(c(C.RED, "  Enter 1-4."))
 
 def print_settings_menu():
+    import away
     from bot_settings import get_settings
     from config import (
         VERBATIM_TURNS, MAX_FACTS_IN_CONTEXT,
@@ -406,11 +407,16 @@ def print_settings_menu():
         FACT_CUTOFF_DAYS,
     )
     s = get_settings()
+    st = away.status()
+    idle = st["idle_seconds"]
+    idle_txt = f"{idle // 60}m ago" if idle >= 0 else "never"
+    away_state = "AWAY" if st["away"] else "present"
     print()
     print(c(C.BOLD, "  Settings:"))
     print(f"    DM replies:       {'ON' if s['dm'] else 'off'}")
     print(f"    Group @mention:   {'ON' if s['group_mention'] else 'off'}")
     print(f"    Self-chat:        {'ON' if s['self_chat'] else 'off'}")
+    print(f"    Away mode:        {away_state} (override: {st['override']}, last active {idle_txt}, threshold {st['threshold_minutes']}m)")
     print()
     print(c(C.DIM, f"  Context: {VERBATIM_TURNS} verbatim turns per session, rolling summary beyond that"))
     print(c(C.DIM, f"  Facts: max {MAX_FACTS_IN_CONTEXT} in context, prune after {FACT_CUTOFF_DAYS}d"))
@@ -431,13 +437,43 @@ def print_settings_submenu():
     print(c(C.BOLD, "  1. Toggle DM replies"))
     print(c(C.BOLD, "  2. Toggle group @mention"))
     print(c(C.BOLD, "  3. Toggle self-chat"))
-    print(c(C.BOLD, "  4. Back"))
+    print(c(C.BOLD, "  4. Set away mode (auto/present/away)"))
+    print(c(C.BOLD, "  5. Back"))
+
+def handle_away_mode():
+    """Interactive away-mode override (auto / present / away)."""
+    import away
+    print()
+    print(c(C.BOLD, "  Away mode:"))
+    print(c(C.DIM, "    auto    = derive from the owner's last activity (default)"))
+    print(c(C.DIM, "    present = force the owner to be present (away mode off)"))
+    print(c(C.DIM, "    away    = force the owner to be away (away mode on)"))
+    while True:
+        raw = input(c(C.CYAN, "  Override (1=auto, 2=present, 3=away, Enter=current): ")).strip()
+        _heal_terminal()
+        if not raw:
+            return
+        if raw in ("1", away.OVERRIDE_AUTO):
+            away.set_override(away.OVERRIDE_AUTO)
+        elif raw in ("2", away.OVERRIDE_PRESENT):
+            away.set_override(away.OVERRIDE_PRESENT)
+        elif raw in ("3", away.OVERRIDE_AWAY):
+            away.set_override(away.OVERRIDE_AWAY)
+        else:
+            print(c(C.RED, "  Enter 1, 2, 3, auto, present, or away."))
+            continue
+        st = away.status()
+        idle = st["idle_seconds"]
+        idle_txt = f"{idle // 60}m ago" if idle >= 0 else "never"
+        state_txt = "AWAY" if st["away"] else "present"
+        print(c(C.GREEN, f"  Away mode set to {st['override']} (owner {state_txt}, last active {idle_txt})."))
+        return
 
 def handle_settings_menu():
     while True:
         print_settings_menu()
         print_settings_submenu()
-        choice = prompt_choice(4)
+        choice = prompt_choice(5)
         if choice is None:
             return
         if choice == 1:
@@ -447,6 +483,8 @@ def handle_settings_menu():
         elif choice == 3:
             toggle_setting("self_chat")
         elif choice == 4:
+            handle_away_mode()
+        elif choice == 5:
             return
 
 def print_sessions_menu():

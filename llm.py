@@ -25,12 +25,15 @@ from config import (
     MAX_REPLY_TOKENS,
     OWNER_NAME,
     OWNER_NUMBER,
+    SIGNATURE_ENABLED,
+    SIGNATURE_NAME,
     VERBATIM_TURNS,
     load_soul,
     norm_phone,
 )
 from database import save_fact, get_facts
 from prompts import GROUP_CHAT_NOTE, SUMMARY_SYSTEM_PROMPT, FACT_EXTRACTION_PROMPT
+import away
 
 
 def get_client_and_model():
@@ -129,12 +132,14 @@ def _owner_tag() -> str:
 
 def build_system_prompt(is_group: bool, is_owner: bool, session_note: str = "",
                         facts_text: str = "", summary_text: str = "",
-                        files_text: str = "") -> str:
+                        files_text: str = "", away_note: str = "") -> str:
     """Assemble the system prompt: SOUL.md + owner/group note + memory context.
 
     Mirrors DiscordBot: the persona (SOUL.md) is the base; the code states who
     the owner is and whether the current sender is them (DMs), or adds the
-    stable group-chat section (shared group sessions).
+    stable group-chat section (shared group sessions). When ``away_note`` is
+    non-empty the owner-is-away note is added so the LLM steps in as the
+    owner's proxy.
     """
     soul = load_soul()
     if is_group:
@@ -159,6 +164,8 @@ def build_system_prompt(is_group: bool, is_owner: bool, session_note: str = "",
         )
 
     extras = []
+    if away_note:
+        extras.append(away_note)
     if session_note:
         extras.append(session_note)
     if facts_text:
@@ -183,10 +190,13 @@ def _facts_text(user_id: str) -> str:
 
 def build_convo(store, session_id: str, user_text: str, user_name: str,
                 is_group: bool, is_owner: bool, user_id: str,
-                session_note: str = "") -> list:
+                session_note: str = "", is_away: bool = False) -> list:
     """Assemble the full conversation: system prompt + session history + the
     current user turn (DiscordBot's single-pipeline model)."""
     summary_text, _ = store.get_summary(session_id)
+    away_note = ""
+    if is_away:
+        away_note = away.away_context(session_id, away.away_announced(session_id))
     system = build_system_prompt(
         is_group=is_group,
         is_owner=is_owner,
@@ -194,6 +204,7 @@ def build_convo(store, session_id: str, user_text: str, user_name: str,
         facts_text=_facts_text(user_id),
         summary_text=summary_text or "",
         files_text=_read_converted_files(),
+        away_note=away_note,
     )
     history = store.history(session_id, VERBATIM_TURNS, label_senders=is_group)
 
@@ -213,11 +224,23 @@ def build_convo(store, session_id: str, user_text: str, user_name: str,
 
 def generate_final_response(store, session_id: str, user_id: str, user_text: str,
                             user_name: str, is_group: bool, is_owner: bool,
-                            session_note: str = "") -> str:
-    """Generate the reply for the current turn."""
+                            session_note: str = "", is_away: bool = False) -> str:
+    """Generate the reply for the current turn.
+
+    When ``is_away`` is set the system prompt carries the owner-is-away note so
+    the LLM steps in as the owner's proxy. The away notice is only pushed on
+    the first reply of a session (``away.away_announced``); later replies keep
+    chatting without re-announcing. A persona signature (e.g. "(Yuki)") is
+    appended to non-group replies when enabled.
+    """
     convo = build_convo(store, session_id, user_text, user_name,
-                        is_group, is_owner, user_id, session_note)
-    return call_llm_api(convo)
+                        is_group, is_owner, user_id, session_note, is_away=is_away)
+    reply = (call_llm_api(convo) or "").strip()
+    if reply and is_away:
+        away.mark_away_announced(session_id)  # notice sent: don't repeat this session
+    if reply and SIGNATURE_ENABLED and not is_group:
+        reply = f"{reply}\n({SIGNATURE_NAME})"
+    return reply
 
 
 # ---- files ----------------------------------------------------------------------
