@@ -447,22 +447,22 @@ def toggle_setting(key):
         print(c(C.RED, f"  {msg}"))
 
 def print_settings_submenu():
-    print(c(C.BOLD, "  1. Toggle DM replies"))
-    print(c(C.BOLD, "  2. Toggle group @mention"))
-    print(c(C.BOLD, "  3. Toggle self-chat"))
-    print(c(C.BOLD, "  4. Set away mode (auto/present/away)"))
-    print(c(C.BOLD, "  5. Back"))
+    print("  [1] Toggle DM replies")
+    print("  [2] Toggle group @mention")
+    print("  [3] Toggle self-chat")
+    print("  [4] Set away mode (auto/present/away)")
+    print("  [5] Back")
 
 def handle_away_mode():
     """Interactive away-mode override (auto / present / away)."""
     import away
     print()
     print(c(C.BOLD, "  Away mode:"))
-    print(c(C.DIM, "    auto    = derive from the owner's last activity (default)"))
-    print(c(C.DIM, "    present = force the owner to be present (away mode off)"))
-    print(c(C.DIM, "    away    = force the owner to be away (away mode on)"))
+    print(c(C.DIM, "    [1] auto    = derive from the owner's last activity (default)"))
+    print(c(C.DIM, "    [2] present = force the owner to be present (away mode off)"))
+    print(c(C.DIM, "    [3] away    = force the owner to be away (away mode on)"))
     while True:
-        raw = input(c(C.CYAN, "  Override (1=auto, 2=present, 3=away, Enter=current): ")).strip()
+        raw = input(c(C.CYAN, "  Override (1-3, Enter=current): ")).strip()
         _heal_terminal()
         if not raw:
             return
