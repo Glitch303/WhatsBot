@@ -3,9 +3,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 
+# Project root (absolute, so paths work from any CWD)
+_PROJECT_ROOT = Path(__file__).resolve().parent
+
 # Database Configuration
-CONV_DB_PATH = "db/conversations.sqlite3"
-NEO_DB_PATH = "db/neonize.sqlite3"
+CONV_DB_PATH = str(_PROJECT_ROOT / "db" / "conversations.sqlite3")
+NEO_DB_PATH = str(_PROJECT_ROOT / "db" / "neonize.sqlite3")
 
 # "openai" or "azure" or "openrouter" or "llamacpp"
 LLM_PROVIDER = os.getenv("LLM_PROVIDER")

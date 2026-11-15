@@ -158,6 +158,9 @@ def main():
     mp_name = model_sub.add_parser("name", help="Set model")
     mp_name.add_argument("model", help="Model name")
 
+    # Menu (TUI)
+    sub.add_parser("menu", help="Interactive TUI menu")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -194,9 +197,20 @@ def main():
         else:
             model_parser.print_help()
             return 1
+    elif args.command == "menu":
+        return cmd_menu(args)
     else:
         parser.print_help()
         return 1
+
+
+def cmd_menu(args):
+    """Launch the interactive TUI menu."""
+    from tui import run
+    try:
+        run()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ connection (except log_stream), filesystem ACL as auth boundary.
 
 import json
 import logging
+import os
 import socket
 import socketserver
 import threading
@@ -17,8 +18,9 @@ from queue import Queue
 
 logger = logging.getLogger("whatsbot.control")
 
-# Socket path (in db/ directory)
-SOCKET_PATH = "db/whatsbot.sock"
+# Socket path (in db/ directory) — use absolute path
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+SOCKET_PATH = os.path.join(_PROJECT_DIR, "db", "whatsbot.sock")
 
 
 class LogStreamHandler(logging.Handler):
