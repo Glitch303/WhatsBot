@@ -283,12 +283,16 @@ def fetch_llamacpp_models(base_url):
     """Fetch available models from a llama.cpp server. Returns list of dicts."""
     import urllib.request
     import json
+    from config import LLAMACPP_API_KEY
     try:
         url = base_url.rstrip("/")
         if not url.endswith("/v1"):
             url += "/v1"
         url += "/models"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        headers = {"Accept": "application/json"}
+        if LLAMACPP_API_KEY:
+            headers["Authorization"] = f"Bearer {LLAMACPP_API_KEY}"
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
         models = []
@@ -387,11 +391,10 @@ def prompt_model_choice():
                 set_runtime("model", model)
                 set_runtime("base_url", None)
             elif choice == "llamacpp":
-                url = input(c(C.CYAN, "  Server URL (default http://localhost:8080/v1): ") or LLAMACPP_BASE_URL).strip()
-                _heal_terminal()
+                url = LLAMACPP_BASE_URL
                 set_runtime("base_url", url)
 
-                print(c(C.DIM, "  Fetching models..."))
+                print(c(C.DIM, f"  Fetching models from {url}..."))
                 models = fetch_llamacpp_models(url)
                 if models is None:
                     print(c(C.YELLOW, "  Could not reach server. Entering model name manually."))
