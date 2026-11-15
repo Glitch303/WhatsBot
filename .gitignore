@@ -178,3 +178,7 @@ cython_debug/
 # Your persona (your own character) — keep private.
 # A public template lives in SOUL.example.md.
 SOUL.md
+
+# File from Serena Plugin.
+
+.serena
