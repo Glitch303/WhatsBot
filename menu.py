@@ -226,7 +226,7 @@ def print_standby_menu(provider, connected):
         away_str = c(C.YELLOW, f"AWAY ({st['idle_seconds'] // 60}m idle)")
     else:
         away_str = c(C.GREEN, f"present ({st['idle_seconds'] // 60}m idle)")
-    print(f"  |  Away:      {away_str}")
+    print(f"  |  Status:    {away_str}")
 
     print(c(C.BOLD, "  |                                   |"))
     print(c(C.BOLD, "  +-----------------------------------+"))
