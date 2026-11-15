@@ -5,15 +5,9 @@ import threading
 import time
 
 def configure_logging():
+    """Configure logging — no file handler in headless mode (logs go to log stream)."""
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-    file_handler = logging.FileHandler("app.log", encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
 
 def main():
     parser = argparse.ArgumentParser(description="WhatsBot")
@@ -23,6 +17,9 @@ def main():
     configure_logging()
 
     from neonize.utils import log
+    # neonize.utils.log calls logging.basicConfig() which resets root to INFO —
+    # re-apply DEBUG after the import.
+    logging.getLogger().setLevel(logging.DEBUG)
     log.setLevel(logging.DEBUG)
     from neonize.client import NewClient
     from neonize.events import MessageEv, ConnectedEv, HistorySyncEv, QREv

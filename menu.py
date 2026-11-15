@@ -193,6 +193,15 @@ def print_standby_menu(provider, connected):
     conn = c(C.GREEN, "CONNECTED") if connected else c(C.YELLOW, "not connected")
     print(f"  |  Session:   {conn}")
 
+    # Away status
+    import away
+    st = away.status()
+    if st["away"]:
+        away_str = c(C.YELLOW, f"AWAY ({st['idle_seconds'] // 60}m idle)")
+    else:
+        away_str = c(C.GREEN, f"present ({st['idle_seconds'] // 60}m idle)")
+    print(f"  |  Away:      {away_str}")
+
     print(c(C.BOLD, "  |                                   |"))
     print(c(C.BOLD, "  +-----------------------------------+"))
     print()
