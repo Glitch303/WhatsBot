@@ -15,7 +15,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from control_server import send_command, SOCKET_PATH
 import menu
-import json
 
 
 def get_status():
@@ -40,11 +39,6 @@ def cmd_start():
 
 def cmd_stop():
     result = send_command(SOCKET_PATH, "command", "stop", {})
-    return result
-
-
-def cmd_quit():
-    result = send_command(SOCKET_PATH, "command", "quit", {})
     return result
 
 
@@ -134,7 +128,6 @@ def run():
             menu.clear()
 
         elif label.startswith("Quit"):
-            cmd_quit()
             break
 
         elif label.startswith("Sessions"):

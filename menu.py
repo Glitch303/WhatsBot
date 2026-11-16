@@ -40,17 +40,6 @@ def check_and_reset_ctrl_c():
         return True
     return False
 
-def _drain_stdin():
-    """Flush any leftover characters from stdin so the next input() starts clean."""
-    try:
-        if not sys.stdin.isatty():
-            return
-        import termios
-        termios.tcflush(sys.stdin, termios.TCIFLUSH)
-    except Exception:
-        pass
-
-
 def _heal_terminal():
     """Verify and repair terminal state after input() calls."""
     if os.name != "posix":
@@ -473,13 +462,6 @@ def toggle_setting(key):
         print(c(C.GREEN, f"  {msg}"))
     else:
         print(c(C.RED, f"  {msg}"))
-
-def print_settings_submenu():
-    print("  [1] Toggle DM replies")
-    print("  [2] Toggle group @mention")
-    print("  [3] Toggle self-chat")
-    print("  [4] Set away mode (auto/present/away)")
-    print("  [5] Back")
 
 def handle_away_mode():
     """Interactive away-mode override (auto / present / away)."""
