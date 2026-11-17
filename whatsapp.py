@@ -746,6 +746,10 @@ def on_message(client: NewClient, message: MessageEv):
                 message.Message.imageMessage.caption or
                 message.Message.documentMessage.caption or
                 "")
+        # Skip non-text events (media without caption, presence updates, etc.)
+        if not text or not text.strip():
+            log.debug(f"Skipping non-text message from {sender_id}.")
+            return
         is_group = message.Info.MessageSource.IsGroup
         is_edit = message.IsEdit
         is_viewonce = message.IsViewOnce or message.IsViewOnceV2 or message.IsViewOnceV2Extension
